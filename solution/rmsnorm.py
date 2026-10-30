@@ -2,6 +2,7 @@ import torch
 import triton
 import triton.language as tl
 
+
 @triton.jit
 def _custom_rmsnorm_fwd_kernel(
     X, Y, W, Rsqrt,
@@ -9,7 +10,7 @@ def _custom_rmsnorm_fwd_kernel(
     N, eps,
     BLOCK_SIZE: tl.constexpr,
 ):
-    row_idx = tl.program_id(0)
+    row_idx = tl.program_id(0).to(tl.int64)
     cols = tl.arange(0, BLOCK_SIZE)
     mask = cols < N
 
@@ -21,10 +22,11 @@ def _custom_rmsnorm_fwd_kernel(
     tl.store(Rsqrt + row_idx, rsqrt)
 
     w = tl.load(W + cols, mask=mask, other=0.0).to(tl.float32)
-    out = (x * rsqrt * w).to(tl.float16)
+    out = (x * rsqrt * w).to(Y.dtype.element_ty)
 
     y_ptrs = Y + row_idx * stride_y_row + cols
     tl.store(y_ptrs, out, mask=mask)
+
 
 @triton.jit
 def _custom_rmsnorm_bwd_kernel(
@@ -33,7 +35,7 @@ def _custom_rmsnorm_bwd_kernel(
     N,
     BLOCK_SIZE: tl.constexpr,
 ):
-    row_idx = tl.program_id(0)
+    row_idx = tl.program_id(0).to(tl.int64)
     cols = tl.arange(0, BLOCK_SIZE)
     mask = cols < N
 
@@ -46,13 +48,14 @@ def _custom_rmsnorm_bwd_kernel(
     c1 = tl.sum(dy_w * x, axis=0) / N
     dx = rsqrt * (dy_w - x * (rsqrt * rsqrt * c1))
 
-    tl.store(dX + row_idx * stride_dx_row + cols, dx.to(tl.float16), mask=mask)
+    tl.store(dX + row_idx * stride_dx_row + cols, dx.to(dX.dtype.element_ty), mask=mask)
+
 
 class TritonRMSNormFunction(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x, weight, eps=1e-6):
         orig_shape = x.shape
-        x_2d = x.reshape(-1, orig_shape[-1])
+        x_2d = x.contiguous().reshape(-1, orig_shape[-1])
         M, N = x_2d.shape
         y = torch.empty_like(x_2d)
         rsqrt = torch.empty(M, device=x.device, dtype=torch.float32)
@@ -74,7 +77,7 @@ class TritonRMSNormFunction(torch.autograd.Function):
     def backward(ctx, dy):
         x_2d, weight, rsqrt = ctx.saved_tensors
         orig_shape = dy.shape
-        dy_2d = dy.reshape(-1, orig_shape[-1])
+        dy_2d = dy.contiguous().reshape(-1, orig_shape[-1])
         M, N = dy_2d.shape
         dx = torch.empty_like(x_2d)
 
@@ -85,4 +88,8 @@ class TritonRMSNormFunction(torch.autograd.Function):
             BLOCK_SIZE=ctx.BLOCK_SIZE,
             num_warps=4,
         )
-        return dx.reshape(*orig_shape), None, None
+        if weight is None or weight.requires_grad is False:
+            return dx.reshape(*orig_shape), None, None
+
+        dw = (dy_2d.float() * (x_2d.float() * rsqrt.unsqueeze(1))).sum(dim=0).to(weight.dtype)
+        return dx.reshape(*orig_shape), dw, None
