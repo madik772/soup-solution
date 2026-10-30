@@ -163,12 +163,13 @@ def _as_contiguous_2d(t: torch.Tensor, last_dim: int) -> torch.Tensor:
 
 class TritonRMSNormFunction(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, x, weight, eps=1e-6):
+    def forward(ctx, x, weight, eps=1e-6, out_dtype=None):
         orig_shape = x.shape
         N = orig_shape[-1]
         x_2d = _as_contiguous_2d(x, N)
         M = x_2d.shape[0]
-        y = torch.empty_like(x_2d)
+        y_dtype = out_dtype if out_dtype is not None else x_2d.dtype
+        y = torch.empty((M, N), device=x.device, dtype=y_dtype)
         rsqrt = torch.empty(M, device=x.device, dtype=torch.float32)
 
         _custom_rmsnorm_fwd_kernel[(M,)](
@@ -201,10 +202,10 @@ class TritonRMSNormFunction(torch.autograd.Function):
             num_stages=2,
         )
         if weight is None or not weight.requires_grad:
-            return dx.view(*orig_shape), None, None
+            return dx.view(*orig_shape), None, None, None
 
         dw = (dy_2d.float() * (x_2d.float() * rsqrt.unsqueeze(1))).sum(dim=0).to(weight.dtype)
-        return dx.view(*orig_shape), dw, None
+        return dx.view(*orig_shape), dw, None, None
 
 
 class TritonFusedAddRMSNormFunction(torch.autograd.Function):

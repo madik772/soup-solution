@@ -10,6 +10,7 @@ from solution.cross_entropy import (
 )
 from solution.swiglu import TritonSwiGLUFunction
 from solution.rope import TritonRoPEFunction
+from solution.attention import TritonCausalAttentionFunction
 from solution.unpad import (
     unpad_input,
     pad_input,
@@ -22,6 +23,53 @@ F._orig_cross_entropy = _orig_F_cross_entropy
 
 _orig_ce_forward = getattr(nn.CrossEntropyLoss, "_orig_forward", nn.CrossEntropyLoss.forward)
 nn.CrossEntropyLoss._orig_forward = _orig_ce_forward
+
+_orig_F_sdpa = getattr(
+    F, "_orig_scaled_dot_product_attention", F.scaled_dot_product_attention
+)
+F._orig_scaled_dot_product_attention = _orig_F_sdpa
+
+
+def custom_scaled_dot_product_attention(
+    query,
+    key,
+    value,
+    attn_mask=None,
+    dropout_p=0.0,
+    is_causal=False,
+    scale=None,
+    enable_gqa=False,
+):
+    if (
+        isinstance(query, torch.Tensor)
+        and query.is_cuda
+        and query.ndim == 4
+        and query.shape[-1] in (64, 128)
+        and query.shape[2] == key.shape[2]
+        and query.shape[1] % key.shape[1] == 0
+        and dropout_p == 0.0
+    ):
+        return TritonCausalAttentionFunction.apply(query, key, value, True)
+    if enable_gqa:
+        return _orig_F_sdpa(
+            query,
+            key,
+            value,
+            attn_mask=attn_mask,
+            dropout_p=dropout_p,
+            is_causal=is_causal,
+            scale=scale,
+            enable_gqa=enable_gqa,
+        )
+    return _orig_F_sdpa(
+        query,
+        key,
+        value,
+        attn_mask=attn_mask,
+        dropout_p=dropout_p,
+        is_causal=is_causal,
+        scale=scale,
+    )
 
 
 def custom_cross_entropy(
@@ -272,6 +320,80 @@ def apply(model=None):
             if isinstance(fwd_globals, dict) and "apply_rotary_pos_emb" in fwd_globals:
                 fwd_globals["apply_rotary_pos_emb"] = custom_apply_rotary_pos_emb
 
+        # 3b. Fused Causal Attention (GQA + Flash-style Online Softmax on Triton)
+        attn_funcs = getattr(modeling_qwen2, "ALL_ATTENTION_FUNCTIONS", None)
+        if attn_funcs is not None and "sdpa" in attn_funcs:
+            _orig_sdpa_attn_fwd = getattr(
+                modeling_qwen2, "_orig_sdpa_attn_fwd", attn_funcs["sdpa"]
+            )
+            modeling_qwen2._orig_sdpa_attn_fwd = _orig_sdpa_attn_fwd
+
+            def custom_sdpa_attention_forward(
+                module,
+                query,
+                key,
+                value,
+                attention_mask,
+                dropout=0.0,
+                scaling=None,
+                is_causal=None,
+                **kwargs,
+            ):
+                if (
+                    isinstance(query, torch.Tensor)
+                    and query.is_cuda
+                    and query.ndim == 4
+                    and query.shape[-1] in (64, 128)
+                    and query.shape[2] == key.shape[2]
+                    and query.shape[1] % key.shape[1] == 0
+                    and dropout == 0.0
+                    and not kwargs.get("output_attentions", False)
+                ):
+                    attn_output = TritonCausalAttentionFunction.apply(query, key, value, True)
+                    return attn_output.transpose(1, 2).contiguous(), None
+                return _orig_sdpa_attn_fwd(
+                    module,
+                    query,
+                    key,
+                    value,
+                    attention_mask,
+                    dropout=dropout,
+                    scaling=scaling,
+                    is_causal=is_causal,
+                    **kwargs,
+                )
+
+            attn_funcs["sdpa"] = custom_sdpa_attention_forward
+            try:
+                from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS as global_attn_funcs
+
+                global_attn_funcs["sdpa"] = custom_sdpa_attention_forward
+            except Exception:
+                pass
+        elif hasattr(modeling_qwen2, "Qwen2SdpaAttention"):
+            _orig_repeat_kv = getattr(
+                modeling_qwen2, "_orig_repeat_kv", getattr(modeling_qwen2, "repeat_kv", None)
+            )
+            if _orig_repeat_kv is not None:
+                modeling_qwen2._orig_repeat_kv = _orig_repeat_kv
+
+                def custom_repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
+                    if (
+                        isinstance(hidden_states, torch.Tensor)
+                        and hidden_states.is_cuda
+                        and hidden_states.ndim == 4
+                        and hidden_states.shape[-1] in (64, 128)
+                    ):
+                        return hidden_states
+                    return _orig_repeat_kv(hidden_states, n_rep)
+
+                modeling_qwen2.repeat_kv = custom_repeat_kv
+                sdpa_globals = getattr(
+                    modeling_qwen2.Qwen2SdpaAttention.forward, "__globals__", None
+                )
+                if isinstance(sdpa_globals, dict) and "repeat_kv" in sdpa_globals:
+                    sdpa_globals["repeat_kv"] = custom_repeat_kv
+
         # 4. Fused Add + RMSNorm in Qwen2DecoderLayer
         if hasattr(modeling_qwen2, "Qwen2DecoderLayer"):
             _orig_decoder_layer_forward = getattr(
@@ -296,7 +418,13 @@ def apply(model=None):
 
                 orig_dtype = hidden_states.dtype
                 residual = hidden_states
-                hidden_states = self.input_layernorm(hidden_states)
+                mlp_dtype = _get_mlp_compute_dtype(self.mlp)
+                hidden_states = TritonRMSNormFunction.apply(
+                    hidden_states,
+                    self.input_layernorm.weight,
+                    self.input_layernorm.variance_epsilon,
+                    mlp_dtype,
+                )
 
                 attn_outputs = self.self_attn(hidden_states, *args, **kwargs)
                 if isinstance(attn_outputs, tuple):
@@ -306,7 +434,6 @@ def apply(model=None):
                     hidden_states = attn_outputs
                     rest = ()
 
-                mlp_dtype = _get_mlp_compute_dtype(self.mlp)
                 hidden_states, residual = TritonFusedAddRMSNormFunction.apply(
                     residual,
                     hidden_states,
@@ -359,7 +486,9 @@ def apply(model=None):
     except Exception:
         pass
 
-    # 6. Patch functional.cross_entropy and nn.CrossEntropyLoss.forward
+    # 6. Patch functional.scaled_dot_product_attention, functional.cross_entropy, and nn.CrossEntropyLoss.forward
+    torch.nn.functional.scaled_dot_product_attention = custom_scaled_dot_product_attention
+    F.scaled_dot_product_attention = custom_scaled_dot_product_attention
     torch.nn.functional.cross_entropy = custom_cross_entropy
     F.cross_entropy = custom_cross_entropy
     nn.CrossEntropyLoss.forward = custom_ce_forward

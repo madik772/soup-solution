@@ -32,6 +32,7 @@ EXPECTED_KERNELS = {
     },
     "cross_entropy.py": {"_custom_ce_fwd_kernel", "_custom_ce_bwd_kernel"},
     "rope.py": {"_custom_fused_rope_fwd_kernel", "_custom_fused_rope_bwd_kernel"},
+    "attention.py": {"_custom_causal_attn_fwd_kernel", "_custom_causal_attn_bwd_kernel"},
     "unpad.py": {"unpad_input", "pad_input"},
 }
 
@@ -157,7 +158,7 @@ def sync_git_repo() -> None:
     if changes:
         print("Detected changes:\n" + changes)
         subprocess.run(["git", "add", "."], cwd=REPO_ROOT, check=True)
-        commit_msg = f"Stage 4: Sequence Unpadding + FP16 MLP & Register RMSNorm ({time.strftime('%Y-%m-%d %H:%M:%S')})"
+        commit_msg = f"Stage 5: Fused Causal GQA Attention + 12 Triton Kernels ({time.strftime('%Y-%m-%d %H:%M:%S')})"
         subprocess.run(["git", "commit", "-m", commit_msg], cwd=REPO_ROOT, check=False)
 
     print("Pushing to origin main...")
