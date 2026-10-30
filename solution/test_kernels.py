@@ -73,6 +73,45 @@ def test_rmsnorm_matches_pytorch(dtype, weight_grad):
 
 @needs_cuda
 @pytest.mark.parametrize("dtype", [torch.float16, torch.float32])
+@pytest.mark.parametrize("layout", ["bshd", "bhsd"])
+def test_rope_matches_pytorch(dtype, layout):
+    from solution.rope import TritonRoPEFunction
+
+    torch.manual_seed(0)
+    B, S, H, D = 2, 64, 12, 128
+    half = D // 2
+    if layout == "bshd":
+        x_shape = (B, S, H, D)
+        cos_u_dim = 2
+    else:
+        x_shape = (B, H, S, D)
+        cos_u_dim = 1
+
+    x = torch.randn(x_shape, device="cuda", dtype=dtype, requires_grad=True)
+    dout = torch.randn(x_shape, device="cuda", dtype=dtype)
+    freqs = torch.randn((B, S, half), device="cuda", dtype=dtype)
+    emb = torch.cat([freqs, freqs], dim=-1)
+    cos = emb.cos()
+    sin = emb.sin()
+
+    x_f = x.float()
+    c_f = cos.float().unsqueeze(cos_u_dim)[..., :half]
+    s_f = sin.float().unsqueeze(cos_u_dim)[..., :half]
+    x1, x2 = x_f[..., :half], x_f[..., half:]
+    ref = torch.cat([x1 * c_f - x2 * s_f, x2 * c_f + x1 * s_f], dim=-1)
+    ref.backward(dout.float())
+    ref_dx = x.grad.float().clone()
+    x.grad = None
+
+    out = TritonRoPEFunction.apply(x, cos, sin)
+    out.backward(dout)
+    tol = TOLERANCE[dtype]
+    torch.testing.assert_close(out.float(), ref, rtol=tol, atol=tol)
+    torch.testing.assert_close(x.grad.float(), ref_dx, rtol=tol, atol=tol)
+
+
+@needs_cuda
+@pytest.mark.parametrize("dtype", [torch.float16, torch.float32])
 @pytest.mark.parametrize("ndim", [2, 3])
 def test_cross_entropy_matches_pytorch(dtype, ndim):
     import solution

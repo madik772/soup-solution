@@ -4,6 +4,7 @@ import torch.nn.functional as F
 from solution.rmsnorm import TritonRMSNormFunction
 from solution.cross_entropy import TritonCrossEntropyFunction
 from solution.swiglu import TritonSwiGLUFunction
+from solution.rope import TritonRoPEFunction
 
 _orig_F_cross_entropy = getattr(F, "_orig_cross_entropy", F.cross_entropy)
 F._orig_cross_entropy = _orig_F_cross_entropy
@@ -141,7 +142,7 @@ def _patch_model_loss_attributes(model):
 
 
 def apply(model=None):
-    # 1. Подменяем Qwen2RMSNorm.forward и Qwen2MLP.forward на кастомные Triton-функции
+    # 1. Подменяем Qwen2RMSNorm, Qwen2MLP и apply_rotary_pos_emb на кастомные Triton-функции
     try:
         from transformers.models.qwen2 import modeling_qwen2
 
@@ -177,6 +178,32 @@ def apply(model=None):
             return self.down_proj(TritonSwiGLUFunction.apply(self.gate_proj(x), self.up_proj(x)))
 
         modeling_qwen2.Qwen2MLP.forward = custom_mlp_forward
+
+        _orig_apply_rotary_pos_emb = getattr(
+            modeling_qwen2,
+            "_orig_apply_rotary_pos_emb",
+            modeling_qwen2.apply_rotary_pos_emb,
+        )
+        modeling_qwen2._orig_apply_rotary_pos_emb = _orig_apply_rotary_pos_emb
+
+        def custom_apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
+            if not q.is_cuda:
+                return _orig_apply_rotary_pos_emb(
+                    q, k, cos, sin, position_ids=position_ids, unsqueeze_dim=unsqueeze_dim
+                )
+            cos_u = cos.unsqueeze(unsqueeze_dim)
+            sin_u = sin.unsqueeze(unsqueeze_dim)
+            q_embed = TritonRoPEFunction.apply(q, cos_u, sin_u)
+            k_embed = TritonRoPEFunction.apply(k, cos_u, sin_u)
+            return q_embed, k_embed
+
+        modeling_qwen2.apply_rotary_pos_emb = custom_apply_rotary_pos_emb
+        if hasattr(modeling_qwen2, "Qwen2Attention") and hasattr(
+            modeling_qwen2.Qwen2Attention, "forward"
+        ):
+            fwd_globals = getattr(modeling_qwen2.Qwen2Attention.forward, "__globals__", None)
+            if isinstance(fwd_globals, dict) and "apply_rotary_pos_emb" in fwd_globals:
+                fwd_globals["apply_rotary_pos_emb"] = custom_apply_rotary_pos_emb
     except Exception:
         pass
 
