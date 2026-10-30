@@ -3,7 +3,11 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from solution.rmsnorm import TritonRMSNormFunction, TritonFusedAddRMSNormFunction
-from solution.cross_entropy import TritonCrossEntropyFunction, ChunkedCrossEntropyFunction
+from solution.cross_entropy import (
+    TritonCrossEntropyFunction,
+    ChunkedCrossEntropyFunction,
+    _ce_forward_nograd,
+)
 from solution.swiglu import TritonSwiGLUFunction
 from solution.rope import TritonRoPEFunction
 
@@ -35,15 +39,15 @@ def custom_cross_entropy(
         and label_smoothing == 0.0
         and reduction in ("mean", "sum")
     ):
-        input_2d = input.reshape(-1, input.shape[-1])
-        target_1d = target.reshape(-1)
-        if input_2d.shape[0] == target_1d.shape[0]:
-            loss = TritonCrossEntropyFunction.apply(input_2d, target_1d, ignore_index)
-            if reduction == "sum":
-                V = input_2d.shape[-1]
-                valid_mask = (target_1d != ignore_index) & (target_1d >= 0) & (target_1d < V)
-                loss = loss * int(valid_mask.sum().item())
-            return loss
+        n_rows = input.shape[0] if input.ndim == 2 else input.shape[0] * input.shape[1]
+        if n_rows == target.numel():
+            if not torch.is_grad_enabled() or not input.requires_grad:
+                input_2d = input if input.ndim == 2 else input.reshape(-1, input.shape[-1])
+                target_1d = target if target.ndim == 1 else target.reshape(-1)
+                return _ce_forward_nograd(input_2d, target_1d, ignore_index, reduction)
+            return TritonCrossEntropyFunction.apply(
+                input, target, ignore_index, reduction
+            )
     return _orig_F_cross_entropy(
         input,
         target,
@@ -57,6 +61,7 @@ def custom_cross_entropy(
 
 
 def custom_ce_forward(self, input, target):
+    reduction = getattr(self, "reduction", "mean")
     if (
         isinstance(input, torch.Tensor)
         and input.is_cuda
@@ -64,18 +69,18 @@ def custom_ce_forward(self, input, target):
         and input.shape[-1] > 10000
         and getattr(self, "weight", None) is None
         and getattr(self, "label_smoothing", 0.0) == 0.0
-        and getattr(self, "reduction", "mean") in ("mean", "sum")
+        and reduction in ("mean", "sum")
     ):
-        input_2d = input.reshape(-1, input.shape[-1])
-        target_1d = target.reshape(-1)
-        if input_2d.shape[0] == target_1d.shape[0]:
+        n_rows = input.shape[0] if input.ndim == 2 else input.shape[0] * input.shape[1]
+        if n_rows == target.numel():
             ignore_index = getattr(self, "ignore_index", -100)
-            loss = TritonCrossEntropyFunction.apply(input_2d, target_1d, ignore_index)
-            if getattr(self, "reduction", "mean") == "sum":
-                V = input_2d.shape[-1]
-                valid_mask = (target_1d != ignore_index) & (target_1d >= 0) & (target_1d < V)
-                loss = loss * int(valid_mask.sum().item())
-            return loss
+            if not torch.is_grad_enabled() or not input.requires_grad:
+                input_2d = input if input.ndim == 2 else input.reshape(-1, input.shape[-1])
+                target_1d = target if target.ndim == 1 else target.reshape(-1)
+                return _ce_forward_nograd(input_2d, target_1d, ignore_index, reduction)
+            return TritonCrossEntropyFunction.apply(
+                input, target, ignore_index, reduction
+            )
     return _orig_ce_forward(self, input, target)
 
 
@@ -95,12 +100,16 @@ def custom_model_loss_function(
         labels = F.pad(labels, (0, 1), value=ignore_index)
         shift_labels = labels[..., 1:].contiguous()
 
+    # Keep logits in native dtype (fp16/bf16); Triton kernel computes reduction in fp32
     logits_2d = (
         logits.view(-1, vocab_size)
         if vocab_size is not None
         else logits.reshape(-1, logits.shape[-1])
     )
-    shift_labels_1d = shift_labels.view(-1).to(logits_2d.device)
+    shift_labels_1d = shift_labels.view(-1)
+    if shift_labels_1d.device != logits_2d.device:
+        shift_labels_1d = shift_labels_1d.to(logits_2d.device)
+
     reduction = "sum" if num_items_in_batch is not None else "mean"
     loss = custom_cross_entropy(
         logits_2d,
@@ -109,7 +118,7 @@ def custom_model_loss_function(
         reduction=reduction,
     )
     if reduction == "sum":
-        if torch.is_tensor(num_items_in_batch):
+        if torch.is_tensor(num_items_in_batch) and num_items_in_batch.device != loss.device:
             num_items_in_batch = num_items_in_batch.to(loss.device)
         loss = loss / num_items_in_batch
     return loss
@@ -145,7 +154,7 @@ def apply(model=None):
     try:
         from transformers.models.qwen2 import modeling_qwen2
 
-        # 1. RMSNorm
+        # 1. RMSNorm (runs on input_layernorm and model.norm)
         _orig_rmsnorm_forward = getattr(
             modeling_qwen2.Qwen2RMSNorm,
             "_orig_forward",
@@ -258,92 +267,40 @@ def apply(model=None):
 
             modeling_qwen2.Qwen2DecoderLayer.forward = custom_decoder_layer_forward
 
-        # 5. Chunked Cross-Entropy in Qwen2ForCausalLM.forward
+        # 5. Patch Qwen2ForCausalLM.loss_function and transformers.loss.loss_utils to avoid fp32 logits upcast
         if hasattr(modeling_qwen2, "Qwen2ForCausalLM"):
-            _orig_causal_lm_forward = getattr(
-                modeling_qwen2.Qwen2ForCausalLM,
-                "_orig_forward",
-                modeling_qwen2.Qwen2ForCausalLM.forward,
-            )
-            modeling_qwen2.Qwen2ForCausalLM._orig_forward = _orig_causal_lm_forward
+            try:
+                modeling_qwen2.Qwen2ForCausalLM.loss_function = staticmethod(
+                    custom_model_loss_function
+                )
+            except Exception:
+                pass
+            if hasattr(modeling_qwen2.Qwen2ForCausalLM, "forward"):
+                clm_globals = getattr(
+                    modeling_qwen2.Qwen2ForCausalLM.forward, "__globals__", None
+                )
+                if isinstance(clm_globals, dict) and "CrossEntropyLoss" in clm_globals:
+                    clm_globals["CrossEntropyLoss"] = nn.CrossEntropyLoss
 
-            def custom_causal_lm_forward(self, *args, **kwargs):
-                if not torch.is_grad_enabled():
-                    return _orig_causal_lm_forward(self, *args, **kwargs)
+        try:
+            from transformers.loss import loss_utils
 
-                orig_lm_head_forward = self.lm_head.forward
-                orig_loss_function = self.loss_function
-                captured = {}
-
-                def hooked_lm_head_forward(h):
-                    if h.is_cuda and h.requires_grad and kwargs.get("labels", None) is not None:
-                        captured["hidden_states"] = h
-                        captured["weight"] = self.lm_head.weight
-                        with torch.no_grad():
-                            return orig_lm_head_forward(h.detach())
-                    return orig_lm_head_forward(h)
-
-                def hooked_loss_function(
-                    logits=None,
-                    labels=None,
-                    vocab_size=None,
-                    num_items_in_batch=None,
-                    ignore_index=-100,
-                    shift_labels=None,
-                    **loss_kwargs,
-                ):
-                    h = captured.get("hidden_states", None)
-                    w = captured.get("weight", None)
-                    if h is not None and w is not None and h.is_cuda and labels is not None:
-                        if shift_labels is None:
-                            padded_labels = F.pad(labels, (0, 1), value=ignore_index)
-                            shift_labels = padded_labels[..., 1:].contiguous()
-                        shift_labels_1d = shift_labels.view(-1).to(h.device)
-                        h_2d = h.reshape(-1, h.shape[-1])
-                        if h_2d.shape[0] == shift_labels_1d.shape[0]:
-                            reduction = "sum" if num_items_in_batch is not None else "mean"
-                            loss = ChunkedCrossEntropyFunction.apply(
-                                h,
-                                w,
-                                shift_labels_1d,
-                                ignore_index,
-                                1024,
-                                reduction,
-                                logits,
-                            )
-                            if reduction == "sum":
-                                if torch.is_tensor(num_items_in_batch):
-                                    num_items_in_batch = num_items_in_batch.to(loss.device)
-                                loss = loss / num_items_in_batch
-                            return loss
-                    return custom_model_loss_function(
-                        logits=logits,
-                        labels=labels,
-                        vocab_size=vocab_size,
-                        num_items_in_batch=num_items_in_batch,
-                        ignore_index=ignore_index,
-                        shift_labels=shift_labels,
-                        **loss_kwargs,
-                    )
-
-                self.lm_head.forward = hooked_lm_head_forward
-                self.loss_function = hooked_loss_function
-                try:
-                    return _orig_causal_lm_forward(self, *args, **kwargs)
-                finally:
-                    self.lm_head.forward = orig_lm_head_forward
-                    self.loss_function = orig_loss_function
-                    captured.clear()
-
-            modeling_qwen2.Qwen2ForCausalLM.forward = custom_causal_lm_forward
+            loss_utils.ForCausalLMLoss = custom_model_loss_function
+            if hasattr(loss_utils, "LOSS_MAPPING") and isinstance(
+                loss_utils.LOSS_MAPPING, dict
+            ):
+                loss_utils.LOSS_MAPPING["ForCausalLM"] = custom_model_loss_function
+                loss_utils.LOSS_MAPPING["ForCausalLMLoss"] = custom_model_loss_function
+        except Exception:
+            pass
     except Exception:
         pass
 
-    # 6. Активируем подмену functional.cross_entropy и nn.CrossEntropyLoss.forward
+    # 6. Patch functional.cross_entropy and nn.CrossEntropyLoss.forward
     torch.nn.functional.cross_entropy = custom_cross_entropy
     F.cross_entropy = custom_cross_entropy
     nn.CrossEntropyLoss.forward = custom_ce_forward
 
-    # 7. Если передан model, обновляем атрибуты loss_function / loss_fct
+    # 7. Patch model instance loss_function / loss_fct if provided
     if model is not None:
         _patch_model_loss_attributes(model)

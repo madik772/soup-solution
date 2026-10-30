@@ -141,6 +141,7 @@ class TritonRoPEFunction(torch.autograd.Function):
             D1, D2, half_dim,
             BLOCK_SIZE=BLOCK_SIZE,
             num_warps=4,
+            num_stages=2,
         )
 
         ctx.save_for_backward(cos_4d, sin_4d)
@@ -168,9 +169,10 @@ class TritonRoPEFunction(torch.autograd.Function):
             D1, D2, half_dim,
             BLOCK_SIZE=ctx.BLOCK_SIZE,
             num_warps=4,
+            num_stages=2,
         )
 
-        return (dx_4d if len(ctx.orig_shape) == 4 else dx_4d.reshape(*ctx.orig_shape)), None, None
+        return (dx_4d if len(ctx.orig_shape) == 4 else dx_4d.reshape(*orig_shape)), None, None
 
 
 def rope(x, cos, sin):

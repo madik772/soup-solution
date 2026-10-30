@@ -197,7 +197,7 @@ def test_chunked_cross_entropy_matches_pytorch(dtype):
     from solution.cross_entropy import ChunkedCrossEntropyFunction
 
     torch.manual_seed(0)
-    N, D, V = 1500, 256, 16384
+    N, D, V = 2500, 256, 16384
     h = torch.randn((N, D), device="cuda", dtype=dtype, requires_grad=True)
     w = torch.randn((V, D), device="cuda", dtype=dtype, requires_grad=False)
     targets = torch.randint(0, V, (N,), device="cuda", dtype=torch.long)
@@ -209,7 +209,7 @@ def test_chunked_cross_entropy_matches_pytorch(dtype):
     ref_loss.backward()
     ref_dh = ref_h.grad.clone()
 
-    loss = ChunkedCrossEntropyFunction.apply(h, w, targets, -100, 1024, "mean", None)
+    loss = ChunkedCrossEntropyFunction.apply(h, w, targets, -100, 2048, "mean", None)
     loss.backward()
 
     tol = TOLERANCE[dtype]

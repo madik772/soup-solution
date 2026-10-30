@@ -89,9 +89,17 @@ class TritonSwiGLUFunction(torch.autograd.Function):
     @staticmethod
     def forward(ctx, gate, up):
         orig_shape = gate.shape
-        gate_2d = gate.contiguous().reshape(-1, orig_shape[-1])
-        up_2d = up.to(gate.dtype).contiguous().reshape(-1, orig_shape[-1])
-        M, N = gate_2d.shape
+        N = orig_shape[-1]
+        if not gate.is_contiguous():
+            gate = gate.contiguous()
+        gate_2d = gate if gate.ndim == 2 else gate.view(-1, N)
+
+        up_cast = up if up.dtype == gate.dtype else up.to(gate.dtype)
+        if not up_cast.is_contiguous():
+            up_cast = up_cast.contiguous()
+        up_2d = up_cast if up_cast.ndim == 2 else up_cast.view(-1, N)
+
+        M = gate_2d.shape[0]
         out_2d = torch.empty_like(gate_2d)
 
         _custom_fused_swiglu_fwd_kernel[(M,)](
@@ -102,17 +110,23 @@ class TritonSwiGLUFunction(torch.autograd.Function):
             N,
             BLOCK_SIZE=BLOCK_SIZE,
             num_warps=4,
+            num_stages=2,
         )
         ctx.save_for_backward(gate_2d, up_2d)
         ctx.orig_shape = orig_shape
-        return out_2d.reshape(*orig_shape)
+        return out_2d.view(*orig_shape)
 
     @staticmethod
     def backward(ctx, grad_out):
         gate_2d, up_2d = ctx.saved_tensors
         orig_shape = ctx.orig_shape
-        grad_2d = grad_out.to(gate_2d.dtype).contiguous().reshape(-1, orig_shape[-1])
         M, N = gate_2d.shape
+
+        grad_cast = grad_out if grad_out.dtype == gate_2d.dtype else grad_out.to(gate_2d.dtype)
+        if not grad_cast.is_contiguous():
+            grad_cast = grad_cast.contiguous()
+        grad_2d = grad_cast if grad_cast.ndim == 2 else grad_cast.view(M, N)
+
         d_gate = torch.empty_like(gate_2d)
         d_up = torch.empty_like(up_2d)
 
@@ -126,8 +140,9 @@ class TritonSwiGLUFunction(torch.autograd.Function):
             N,
             BLOCK_SIZE=BLOCK_SIZE,
             num_warps=4,
+            num_stages=2,
         )
-        return d_gate.reshape(*orig_shape), d_up.reshape(*orig_shape)
+        return d_gate.view(*orig_shape), d_up.view(*orig_shape)
 
 
 def swiglu(gate, up):

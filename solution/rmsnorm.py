@@ -2,6 +2,8 @@ import torch
 import triton
 import triton.language as tl
 
+BLOCK_SIZE = 1024
+
 
 @triton.jit
 def _custom_rmsnorm_fwd_kernel(
@@ -11,21 +13,27 @@ def _custom_rmsnorm_fwd_kernel(
     BLOCK_SIZE: tl.constexpr,
 ):
     row_idx = tl.program_id(0).to(tl.int64)
-    cols = tl.arange(0, BLOCK_SIZE)
-    mask = cols < N
+    x_row_ptr = X + row_idx * stride_x_row
+    y_row_ptr = Y + row_idx * stride_y_row
 
-    x_ptrs = X + row_idx * stride_x_row + cols
-    x = tl.load(x_ptrs, mask=mask, other=0.0).to(tl.float32)
+    var_sum = 0.0
+    for off in range(0, N, BLOCK_SIZE):
+        cols = off + tl.arange(0, BLOCK_SIZE)
+        mask = cols < N
+        x = tl.load(x_row_ptr + cols, mask=mask, other=0.0).to(tl.float32)
+        var_sum += tl.sum(x * x, axis=0)
 
-    var = tl.sum(x * x, axis=0) / N
+    var = var_sum / N
     rsqrt = tl.rsqrt(var + eps)
     tl.store(Rsqrt + row_idx, rsqrt)
 
-    w = tl.load(W + cols, mask=mask, other=0.0).to(tl.float32)
-    out = (x * rsqrt * w).to(Y.dtype.element_ty)
-
-    y_ptrs = Y + row_idx * stride_y_row + cols
-    tl.store(y_ptrs, out, mask=mask)
+    for off in range(0, N, BLOCK_SIZE):
+        cols = off + tl.arange(0, BLOCK_SIZE)
+        mask = cols < N
+        x = tl.load(x_row_ptr + cols, mask=mask, other=0.0).to(tl.float32)
+        w = tl.load(W + cols, mask=mask, other=0.0).to(tl.float32)
+        out = (x * rsqrt * w).to(Y.dtype.element_ty)
+        tl.store(y_row_ptr + cols, out, mask=mask)
 
 
 @triton.jit
@@ -36,19 +44,31 @@ def _custom_rmsnorm_bwd_kernel(
     BLOCK_SIZE: tl.constexpr,
 ):
     row_idx = tl.program_id(0).to(tl.int64)
-    cols = tl.arange(0, BLOCK_SIZE)
-    mask = cols < N
-
-    dy = tl.load(dY + row_idx * stride_dy_row + cols, mask=mask, other=0.0).to(tl.float32)
-    x = tl.load(X + row_idx * stride_x_row + cols, mask=mask, other=0.0).to(tl.float32)
-    w = tl.load(W + cols, mask=mask, other=0.0).to(tl.float32)
+    dy_row_ptr = dY + row_idx * stride_dy_row
+    x_row_ptr = X + row_idx * stride_x_row
+    dx_row_ptr = dX + row_idx * stride_dx_row
     rsqrt = tl.load(Rsqrt + row_idx)
 
-    dy_w = dy * w
-    c1 = tl.sum(dy_w * x, axis=0) / N
-    dx = rsqrt * (dy_w - x * (rsqrt * rsqrt * c1))
+    dot_sum = 0.0
+    for off in range(0, N, BLOCK_SIZE):
+        cols = off + tl.arange(0, BLOCK_SIZE)
+        mask = cols < N
+        dy = tl.load(dy_row_ptr + cols, mask=mask, other=0.0).to(tl.float32)
+        x = tl.load(x_row_ptr + cols, mask=mask, other=0.0).to(tl.float32)
+        w = tl.load(W + cols, mask=mask, other=0.0).to(tl.float32)
+        dot_sum += tl.sum(dy * w * x, axis=0)
 
-    tl.store(dX + row_idx * stride_dx_row + cols, dx.to(dX.dtype.element_ty), mask=mask)
+    c1 = dot_sum / N
+
+    for off in range(0, N, BLOCK_SIZE):
+        cols = off + tl.arange(0, BLOCK_SIZE)
+        mask = cols < N
+        dy = tl.load(dy_row_ptr + cols, mask=mask, other=0.0).to(tl.float32)
+        x = tl.load(x_row_ptr + cols, mask=mask, other=0.0).to(tl.float32)
+        w = tl.load(W + cols, mask=mask, other=0.0).to(tl.float32)
+        dy_w = dy * w
+        dx = rsqrt * (dy_w - x * (rsqrt * rsqrt * c1))
+        tl.store(dx_row_ptr + cols, dx.to(dX.dtype.element_ty), mask=mask)
 
 
 @triton.jit
@@ -130,48 +150,56 @@ def _custom_fused_add_rmsnorm_bwd_kernel(
         tl.store(dsum_row_ptr + cols, d_sum.to(dSumRes.dtype.element_ty), mask=mask)
 
 
+def _as_contiguous_2d(t: torch.Tensor, last_dim: int) -> torch.Tensor:
+    if not t.is_contiguous():
+        t = t.contiguous()
+    return t if t.ndim == 2 else t.view(-1, last_dim)
+
+
 class TritonRMSNormFunction(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x, weight, eps=1e-6):
         orig_shape = x.shape
-        x_2d = x.contiguous().reshape(-1, orig_shape[-1])
-        M, N = x_2d.shape
+        N = orig_shape[-1]
+        x_2d = _as_contiguous_2d(x, N)
+        M = x_2d.shape[0]
         y = torch.empty_like(x_2d)
         rsqrt = torch.empty(M, device=x.device, dtype=torch.float32)
 
-        BLOCK_SIZE = triton.next_power_of_2(N)
         _custom_rmsnorm_fwd_kernel[(M,)](
             x_2d, y, weight, rsqrt,
             x_2d.stride(0), y.stride(0),
             N, eps,
             BLOCK_SIZE=BLOCK_SIZE,
             num_warps=4,
+            num_stages=2,
         )
         ctx.save_for_backward(x_2d, weight, rsqrt)
-        ctx.BLOCK_SIZE = BLOCK_SIZE
         ctx.N = N
-        return y.reshape(*orig_shape)
+        return y.view(*orig_shape)
 
     @staticmethod
     def backward(ctx, dy):
         x_2d, weight, rsqrt = ctx.saved_tensors
         orig_shape = dy.shape
-        dy_2d = dy.contiguous().reshape(-1, orig_shape[-1])
-        M, _ = dy_2d.shape
+        N = ctx.N
+        dy_2d = _as_contiguous_2d(dy, N)
+        M = dy_2d.shape[0]
         dx = torch.empty_like(x_2d)
 
         _custom_rmsnorm_bwd_kernel[(M,)](
             dy_2d, x_2d, weight, rsqrt, dx,
             dy_2d.stride(0), x_2d.stride(0), dx.stride(0),
-            ctx.N,
-            BLOCK_SIZE=ctx.BLOCK_SIZE,
+            N,
+            BLOCK_SIZE=BLOCK_SIZE,
             num_warps=4,
+            num_stages=2,
         )
-        if weight is None or weight.requires_grad is False:
-            return dx.reshape(*orig_shape), None, None
+        if weight is None or not weight.requires_grad:
+            return dx.view(*orig_shape), None, None
 
         dw = (dy_2d.float() * (x_2d.float() * rsqrt.unsqueeze(1))).sum(dim=0).to(weight.dtype)
-        return dx.reshape(*orig_shape), dw, None
+        return dx.view(*orig_shape), dw, None
 
 
 class TritonFusedAddRMSNormFunction(torch.autograd.Function):
@@ -179,27 +207,28 @@ class TritonFusedAddRMSNormFunction(torch.autograd.Function):
     def forward(ctx, residual, x, weight, eps=1e-6):
         ctx.set_materialize_grads(False)
         orig_shape = x.shape
-        res_2d = residual.contiguous().reshape(-1, orig_shape[-1])
-        x_2d = x.to(res_2d.dtype).contiguous().reshape(-1, orig_shape[-1])
-        M, N = x_2d.shape
+        N = orig_shape[-1]
+        res_2d = _as_contiguous_2d(residual, N)
+        x_cast = x if x.dtype == res_2d.dtype else x.to(res_2d.dtype)
+        x_2d = _as_contiguous_2d(x_cast, N)
+        M = x_2d.shape[0]
 
         res_out_2d = torch.empty_like(res_2d)
         y_2d = torch.empty_like(x_2d)
         rsqrt = torch.empty(M, device=x.device, dtype=torch.float32)
 
-        BLOCK_SIZE = 1024
         _custom_fused_add_rmsnorm_fwd_kernel[(M,)](
             res_2d, x_2d, weight, res_out_2d, y_2d, rsqrt,
             res_2d.stride(0), x_2d.stride(0), res_out_2d.stride(0), y_2d.stride(0),
             N, eps,
             BLOCK_SIZE=BLOCK_SIZE,
             num_warps=4,
+            num_stages=2,
         )
         ctx.save_for_backward(res_out_2d, weight, rsqrt)
         ctx.orig_shape = orig_shape
         ctx.N = N
-        ctx.BLOCK_SIZE = BLOCK_SIZE
-        return y_2d.reshape(*orig_shape), res_out_2d.reshape(*orig_shape)
+        return y_2d.view(*orig_shape), res_out_2d.view(*orig_shape)
 
     @staticmethod
     def backward(ctx, dy, d_res_out):
@@ -210,11 +239,13 @@ class TritonFusedAddRMSNormFunction(torch.autograd.Function):
         if dy is None:
             dy_2d = torch.zeros_like(res_out_2d)
         else:
-            dy_2d = dy.to(res_out_2d.dtype).contiguous().reshape(M, N)
+            dy_cast = dy if dy.dtype == res_out_2d.dtype else dy.to(res_out_2d.dtype)
+            dy_2d = _as_contiguous_2d(dy_cast, N)
 
         has_dres = d_res_out is not None
         if has_dres:
-            dres_2d = d_res_out.to(res_out_2d.dtype).contiguous().reshape(M, N)
+            dres_cast = d_res_out if d_res_out.dtype == res_out_2d.dtype else d_res_out.to(res_out_2d.dtype)
+            dres_2d = _as_contiguous_2d(dres_cast, N)
             dres_stride = dres_2d.stride(0)
         else:
             dres_2d = res_out_2d
@@ -227,12 +258,13 @@ class TritonFusedAddRMSNormFunction(torch.autograd.Function):
             dy_2d.stride(0), dres_stride, res_out_2d.stride(0), d_sum_2d.stride(0),
             N,
             HAS_DRES=has_dres,
-            BLOCK_SIZE=ctx.BLOCK_SIZE,
+            BLOCK_SIZE=BLOCK_SIZE,
             num_warps=4,
+            num_stages=2,
         )
 
-        d_sum = d_sum_2d.reshape(*orig_shape)
-        if weight is None or weight.requires_grad is False:
+        d_sum = d_sum_2d.view(*orig_shape)
+        if weight is None or not weight.requires_grad:
             return d_sum, d_sum, None, None
 
         dw = (dy_2d.float() * (res_out_2d.float() * rsqrt.unsqueeze(1))).sum(dim=0).to(weight.dtype)

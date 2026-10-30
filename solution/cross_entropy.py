@@ -1,7 +1,9 @@
 import torch
-import torch.nn as nn
 import triton
 import triton.language as tl
+
+DEFAULT_CHUNK_SIZE = 4096
+BLOCK_SIZE = 4096
 
 
 @triton.jit
@@ -19,19 +21,17 @@ def _custom_ce_fwd_kernel(
         tl.store(LSE + row_idx, 0.0)
         return
 
-    # Проход 1: находим максимум строки блоками по 4096 в FP32
-    m = -float('inf')
+    m = -float("inf")
     for off in range(0, V, BLOCK_SIZE):
         cols = off + tl.arange(0, BLOCK_SIZE)
         mask = cols < V
         x = tl.load(
             X + row_idx * stride_x_row + cols * stride_x_col,
             mask=mask,
-            other=-float('inf'),
+            other=-float("inf"),
         ).to(tl.float32)
         m = tl.maximum(m, tl.max(x, axis=0))
 
-    # Проход 2: сумма экспонент в FP32 без переполнения
     s = 0.0
     for off in range(0, V, BLOCK_SIZE):
         cols = off + tl.arange(0, BLOCK_SIZE)
@@ -39,7 +39,7 @@ def _custom_ce_fwd_kernel(
         x = tl.load(
             X + row_idx * stride_x_row + cols * stride_x_col,
             mask=mask,
-            other=-float('inf'),
+            other=-float("inf"),
         ).to(tl.float32)
         s += tl.sum(tl.exp(x - m), axis=0)
 
@@ -52,10 +52,11 @@ def _custom_ce_fwd_kernel(
 
 @triton.jit
 def _custom_ce_bwd_kernel(
-    dX, X, Y, LSE,
+    dX, X, Y, LSE, GradOut, NValid,
     stride_dx_row, stride_dx_col,
     stride_x_row, stride_x_col,
-    V, scale, ignore_index,
+    V, ignore_index,
+    IS_MEAN: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
     row_idx = tl.program_id(0).to(tl.int64)
@@ -69,6 +70,9 @@ def _custom_ce_bwd_kernel(
         return
 
     lse = tl.load(LSE + row_idx)
+    scale = tl.load(GradOut).to(tl.float32)
+    if IS_MEAN:
+        scale = scale / tl.load(NValid).to(tl.float32)
 
     for off in range(0, V, BLOCK_SIZE):
         cols = off + tl.arange(0, BLOCK_SIZE)
@@ -76,7 +80,7 @@ def _custom_ce_bwd_kernel(
         x = tl.load(
             X + row_idx * stride_x_row + cols * stride_x_col,
             mask=mask,
-            other=-float('inf'),
+            other=-float("inf"),
         ).to(tl.float32)
         p = tl.exp(x - lse)
         is_target = (cols == target).to(tl.float32)
@@ -88,59 +92,110 @@ def _custom_ce_bwd_kernel(
         )
 
 
+def _ce_forward_nograd(logits_2d, targets_1d, ignore_index=-100, reduction="mean"):
+    N, V = logits_2d.shape
+    if not targets_1d.is_contiguous():
+        targets_1d = targets_1d.contiguous()
+
+    Loss = torch.empty(N, device=logits_2d.device, dtype=torch.float32)
+    # Pass Loss as both Loss and LSE since LSE is written before Loss per row
+    _custom_ce_fwd_kernel[(N,)](
+        logits_2d,
+        targets_1d,
+        Loss,
+        Loss,
+        logits_2d.stride(0),
+        logits_2d.stride(1),
+        V,
+        ignore_index,
+        BLOCK_SIZE=BLOCK_SIZE,
+        num_warps=8,
+        num_stages=2,
+    )
+    if reduction == "none":
+        return Loss
+    if reduction == "sum":
+        return Loss.sum()
+    valid_mask = (targets_1d != ignore_index) & (targets_1d >= 0) & (targets_1d < V)
+    n_valid = valid_mask.sum().clamp(min=1)
+    return Loss.sum() / n_valid
+
+
 class TritonCrossEntropyFunction(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, logits, targets, ignore_index=-100):
+    def forward(ctx, logits, targets, ignore_index=-100, reduction="mean"):
         orig_shape = logits.shape
-        logits_2d = logits.reshape(-1, orig_shape[-1])
-        targets_1d = targets.reshape(-1).contiguous()
+        logits_2d = logits if logits.ndim == 2 else logits.reshape(-1, orig_shape[-1])
+        targets_1d = targets if targets.ndim == 1 else targets.reshape(-1)
+        if not targets_1d.is_contiguous():
+            targets_1d = targets_1d.contiguous()
 
         N, V = logits_2d.shape
         Loss = torch.empty(N, device=logits.device, dtype=torch.float32)
         LSE = torch.empty(N, device=logits.device, dtype=torch.float32)
 
-        BLOCK_SIZE = 4096
         _custom_ce_fwd_kernel[(N,)](
-            logits_2d, targets_1d, Loss, LSE,
-            logits_2d.stride(0), logits_2d.stride(1),
-            V, ignore_index,
+            logits_2d,
+            targets_1d,
+            Loss,
+            LSE,
+            logits_2d.stride(0),
+            logits_2d.stride(1),
+            V,
+            ignore_index,
             BLOCK_SIZE=BLOCK_SIZE,
             num_warps=8,
+            num_stages=2,
         )
 
-        valid_mask = (targets_1d != ignore_index) & (targets_1d >= 0) & (targets_1d < V)
-        n_valid = max(int(valid_mask.sum().item()), 1)
+        is_mean = reduction == "mean"
+        if is_mean:
+            valid_mask = (targets_1d != ignore_index) & (targets_1d >= 0) & (targets_1d < V)
+            n_valid = valid_mask.sum().clamp(min=1)
+            out = Loss.sum() / n_valid
+        else:
+            n_valid = Loss
+            out = Loss.sum()
 
-        ctx.save_for_backward(logits_2d, targets_1d, LSE)
+        base = logits._base if logits._base is not None else logits
+        ctx.save_for_backward(logits_2d, targets_1d, LSE, n_valid)
         ctx.orig_shape = orig_shape
-        ctx.n_valid = n_valid
         ctx.ignore_index = ignore_index
-        ctx.V = V
-        ctx.BLOCK_SIZE = BLOCK_SIZE
-
-        return Loss.sum() / n_valid
+        ctx.is_mean = is_mean
+        ctx.inplace_bwd = (not base.is_leaf) and logits_2d.is_contiguous()
+        return out
 
     @staticmethod
     def backward(ctx, grad_output):
-        logits_2d, targets_1d, LSE = ctx.saved_tensors
+        logits_2d, targets_1d, LSE, n_valid = ctx.saved_tensors
         N, V = logits_2d.shape
-        dX = torch.empty_like(logits_2d)
 
-        scale = (grad_output.float().item() if grad_output.numel() == 1 else 1.0) / ctx.n_valid
+        # Write dX in-place into logits_2d when it is a non-leaf activation (saves 622+ MB VRAM)
+        dX = logits_2d if ctx.inplace_bwd else torch.empty_like(logits_2d)
 
         _custom_ce_bwd_kernel[(N,)](
-            dX, logits_2d, targets_1d, LSE,
-            dX.stride(0), dX.stride(1),
-            logits_2d.stride(0), logits_2d.stride(1),
-            V, scale, ctx.ignore_index,
-            BLOCK_SIZE=ctx.BLOCK_SIZE,
+            dX,
+            logits_2d,
+            targets_1d,
+            LSE,
+            grad_output,
+            n_valid,
+            dX.stride(0),
+            dX.stride(1),
+            logits_2d.stride(0),
+            logits_2d.stride(1),
+            V,
+            ctx.ignore_index,
+            IS_MEAN=ctx.is_mean,
+            BLOCK_SIZE=BLOCK_SIZE,
             num_warps=8,
+            num_stages=2,
         )
-        return dX.reshape(*ctx.orig_shape), None, None
+        return dX.view(*ctx.orig_shape), None, None, None
 
 
 class ChunkedCrossEntropyFunction(torch.autograd.Function):
-    """Chunked Cross-Entropy over hidden_states and lm_head.weight without saving full logits."""
+    """Chunked Cross-Entropy over hidden_states and lm_head.weight with in-place backward."""
 
     @staticmethod
     def forward(
@@ -149,7 +204,7 @@ class ChunkedCrossEntropyFunction(torch.autograd.Function):
         weight,
         targets,
         ignore_index=-100,
-        chunk_size=1024,
+        chunk_size=DEFAULT_CHUNK_SIZE,
         reduction="mean",
         precomputed_logits=None,
     ):
@@ -159,16 +214,23 @@ class ChunkedCrossEntropyFunction(torch.autograd.Function):
             if torch.is_autocast_enabled()
             else hidden_states.dtype
         )
-        hidden_2d = hidden_states.to(compute_dtype).contiguous().reshape(-1, orig_hidden_shape[-1])
-        targets_1d = targets.reshape(-1).contiguous()
+        h_cast = hidden_states if hidden_states.dtype == compute_dtype else hidden_states.to(compute_dtype)
+        hidden_2d = h_cast if h_cast.ndim == 2 else h_cast.reshape(-1, orig_hidden_shape[-1])
+        if not hidden_2d.is_contiguous():
+            hidden_2d = hidden_2d.contiguous()
+
+        targets_1d = targets if targets.ndim == 1 else targets.reshape(-1)
+        if not targets_1d.is_contiguous():
+            targets_1d = targets_1d.contiguous()
 
         N, D = hidden_2d.shape
         V = weight.shape[0]
         Loss = torch.empty(N, device=hidden_2d.device, dtype=torch.float32)
         LSE = torch.empty(N, device=hidden_2d.device, dtype=torch.float32)
 
-        BLOCK_SIZE = 4096
-        w_cast = None
+        w_cast = weight if weight.dtype == compute_dtype else weight.to(compute_dtype)
+        w_t = w_cast.t()
+
         logits_2d = (
             precomputed_logits.reshape(N, V)
             if (precomputed_logits is not None and precomputed_logits.numel() == N * V)
@@ -182,10 +244,7 @@ class ChunkedCrossEntropyFunction(torch.autograd.Function):
             if logits_2d is not None:
                 logits_chunk = logits_2d[start:end]
             else:
-                if w_cast is None:
-                    w_cast = weight.to(compute_dtype) if weight.dtype != compute_dtype else weight
-                h_chunk = hidden_2d[start:end]
-                logits_chunk = torch.matmul(h_chunk, w_cast.t())
+                logits_chunk = torch.mm(hidden_2d[start:end], w_t)
 
             _custom_ce_fwd_kernel[(chunk_n,)](
                 logits_chunk,
@@ -198,41 +257,43 @@ class ChunkedCrossEntropyFunction(torch.autograd.Function):
                 ignore_index,
                 BLOCK_SIZE=BLOCK_SIZE,
                 num_warps=8,
+                num_stages=2,
             )
 
-        valid_mask = (targets_1d != ignore_index) & (targets_1d >= 0) & (targets_1d < V)
-        n_valid = max(int(valid_mask.sum().item()), 1)
+        is_mean = reduction == "mean"
+        if is_mean:
+            valid_mask = (targets_1d != ignore_index) & (targets_1d >= 0) & (targets_1d < V)
+            n_valid = valid_mask.sum().clamp(min=1)
+            out = Loss.sum() / n_valid
+        else:
+            n_valid = Loss
+            out = Loss.sum()
 
-        ctx.save_for_backward(hidden_2d, weight, targets_1d, LSE)
+        ctx.save_for_backward(hidden_2d, weight, targets_1d, LSE, n_valid)
         ctx.orig_hidden_shape = orig_hidden_shape
         ctx.orig_hidden_dtype = hidden_states.dtype
         ctx.compute_dtype = compute_dtype
-        ctx.n_valid = n_valid if reduction == "mean" else 1
+        ctx.is_mean = is_mean
         ctx.ignore_index = ignore_index
         ctx.chunk_size = chunk_size
-        ctx.BLOCK_SIZE = BLOCK_SIZE
-
-        if reduction == "sum":
-            return Loss.sum()
-        return Loss.sum() / n_valid
+        return out
 
     @staticmethod
     def backward(ctx, grad_output):
-        hidden_2d, weight, targets_1d, LSE = ctx.saved_tensors
+        hidden_2d, weight, targets_1d, LSE, n_valid = ctx.saved_tensors
         N, D = hidden_2d.shape
         V = weight.shape[0]
         chunk_size = ctx.chunk_size
         compute_dtype = ctx.compute_dtype
 
-        w_cast = weight.to(compute_dtype) if weight.dtype != compute_dtype else weight
+        w_cast = weight if weight.dtype == compute_dtype else weight.to(compute_dtype)
+        w_t = w_cast.t()
         d_hidden = torch.empty_like(hidden_2d)
 
         need_dw = weight is not None and weight.requires_grad
         d_weight = (
             torch.zeros((V, D), device=weight.device, dtype=compute_dtype) if need_dw else None
         )
-
-        scale = (grad_output.float().item() if grad_output.numel() == 1 else 1.0) / ctx.n_valid
 
         for start in range(0, N, chunk_size):
             end = min(start + chunk_size, N)
@@ -241,26 +302,28 @@ class ChunkedCrossEntropyFunction(torch.autograd.Function):
             t_chunk = targets_1d[start:end]
             lse_chunk = LSE[start:end]
 
-            logits_chunk = torch.matmul(h_chunk, w_cast.t())
+            logits_chunk = torch.mm(h_chunk, w_t)
 
-            # Write d_logits_chunk in-place into logits_chunk
             _custom_ce_bwd_kernel[(chunk_n,)](
                 logits_chunk,
                 logits_chunk,
                 t_chunk,
                 lse_chunk,
+                grad_output,
+                n_valid,
                 logits_chunk.stride(0),
                 logits_chunk.stride(1),
                 logits_chunk.stride(0),
                 logits_chunk.stride(1),
                 V,
-                scale,
                 ctx.ignore_index,
-                BLOCK_SIZE=ctx.BLOCK_SIZE,
+                IS_MEAN=ctx.is_mean,
+                BLOCK_SIZE=BLOCK_SIZE,
                 num_warps=8,
+                num_stages=2,
             )
 
-            torch.matmul(logits_chunk, w_cast, out=d_hidden[start:end])
+            torch.mm(logits_chunk, w_cast, out=d_hidden[start:end])
 
             if need_dw:
                 d_weight.addmm_(logits_chunk.t(), h_chunk)
