@@ -2,7 +2,8 @@ import torch
 import triton
 import triton.language as tl
 
-DEFAULT_CHUNK_SIZE = 2048
+CHUNK_SIZE = 4096
+DEFAULT_CHUNK_SIZE = 4096
 BLOCK_SIZE = 4096
 
 
@@ -98,19 +99,22 @@ def _ce_forward_nograd(logits_2d, targets_1d, ignore_index=-100, reduction="mean
         targets_1d = targets_1d.contiguous()
 
     Loss = torch.empty(N, device=logits_2d.device, dtype=torch.float32)
-    _custom_ce_fwd_kernel[(N,)](
-        logits_2d,
-        targets_1d,
-        Loss,
-        Loss,
-        logits_2d.stride(0),
-        logits_2d.stride(1),
-        V,
-        ignore_index,
-        BLOCK_SIZE=BLOCK_SIZE,
-        num_warps=8,
-        num_stages=2,
-    )
+    for start in range(0, N, CHUNK_SIZE):
+        end = min(start + CHUNK_SIZE, N)
+        chunk_n = end - start
+        _custom_ce_fwd_kernel[(chunk_n,)](
+            logits_2d[start:end],
+            targets_1d[start:end],
+            Loss[start:end],
+            Loss[start:end],
+            logits_2d.stride(0),
+            logits_2d.stride(1),
+            V,
+            ignore_index,
+            BLOCK_SIZE=BLOCK_SIZE,
+            num_warps=8,
+            num_stages=2,
+        )
     if reduction == "none":
         return Loss
     if reduction == "sum":
@@ -133,19 +137,22 @@ class TritonCrossEntropyFunction(torch.autograd.Function):
         Loss = torch.empty(N, device=logits.device, dtype=torch.float32)
         LSE = torch.empty(N, device=logits.device, dtype=torch.float32)
 
-        _custom_ce_fwd_kernel[(N,)](
-            logits_2d,
-            targets_1d,
-            Loss,
-            LSE,
-            logits_2d.stride(0),
-            logits_2d.stride(1),
-            V,
-            ignore_index,
-            BLOCK_SIZE=BLOCK_SIZE,
-            num_warps=8,
-            num_stages=2,
-        )
+        for start in range(0, N, CHUNK_SIZE):
+            end = min(start + CHUNK_SIZE, N)
+            chunk_n = end - start
+            _custom_ce_fwd_kernel[(chunk_n,)](
+                logits_2d[start:end],
+                targets_1d[start:end],
+                Loss[start:end],
+                LSE[start:end],
+                logits_2d.stride(0),
+                logits_2d.stride(1),
+                V,
+                ignore_index,
+                BLOCK_SIZE=BLOCK_SIZE,
+                num_warps=8,
+                num_stages=2,
+            )
 
         is_mean = reduction == "mean"
         if is_mean:
@@ -171,29 +178,32 @@ class TritonCrossEntropyFunction(torch.autograd.Function):
 
         dX = logits_2d if ctx.inplace_bwd else torch.empty_like(logits_2d)
 
-        _custom_ce_bwd_kernel[(N,)](
-            dX,
-            logits_2d,
-            targets_1d,
-            LSE,
-            grad_output,
-            n_valid,
-            dX.stride(0),
-            dX.stride(1),
-            logits_2d.stride(0),
-            logits_2d.stride(1),
-            V,
-            ctx.ignore_index,
-            IS_MEAN=ctx.is_mean,
-            BLOCK_SIZE=BLOCK_SIZE,
-            num_warps=8,
-            num_stages=2,
-        )
+        for start in range(0, N, CHUNK_SIZE):
+            end = min(start + CHUNK_SIZE, N)
+            chunk_n = end - start
+            _custom_ce_bwd_kernel[(chunk_n,)](
+                dX[start:end],
+                logits_2d[start:end],
+                targets_1d[start:end],
+                LSE[start:end],
+                grad_output,
+                n_valid,
+                dX.stride(0),
+                dX.stride(1),
+                logits_2d.stride(0),
+                logits_2d.stride(1),
+                V,
+                ctx.ignore_index,
+                IS_MEAN=ctx.is_mean,
+                BLOCK_SIZE=BLOCK_SIZE,
+                num_warps=8,
+                num_stages=2,
+            )
         return dX.view(*ctx.orig_shape), None, None, None
 
 
 class ChunkedCrossEntropyFunction(torch.autograd.Function):
-    """Chunked Cross-Entropy over hidden_states and lm_head.weight with CHUNK_SIZE=2048."""
+    """Streaming Chunked Cross-Entropy over hidden_states and lm_head.weight with CHUNK_SIZE=4096."""
 
     @staticmethod
     def forward(
@@ -202,7 +212,7 @@ class ChunkedCrossEntropyFunction(torch.autograd.Function):
         weight,
         targets,
         ignore_index=-100,
-        chunk_size=DEFAULT_CHUNK_SIZE,
+        chunk_size=CHUNK_SIZE,
         reduction="mean",
         precomputed_logits=None,
     ):
@@ -212,7 +222,11 @@ class ChunkedCrossEntropyFunction(torch.autograd.Function):
             if torch.is_autocast_enabled()
             else hidden_states.dtype
         )
-        h_cast = hidden_states if hidden_states.dtype == compute_dtype else hidden_states.to(compute_dtype)
+        h_cast = (
+            hidden_states
+            if hidden_states.dtype == compute_dtype
+            else hidden_states.to(compute_dtype)
+        )
         hidden_2d = h_cast if h_cast.ndim == 2 else h_cast.reshape(-1, orig_hidden_shape[-1])
         if not hidden_2d.is_contiguous():
             hidden_2d = hidden_2d.contiguous()

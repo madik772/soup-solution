@@ -10,7 +10,6 @@ from solution.cross_entropy import (
 )
 from solution.swiglu import TritonSwiGLUFunction
 from solution.rope import TritonRoPEFunction
-from solution.attention import TritonCausalAttentionFunction
 from solution.unpad import (
     unpad_input,
     pad_input,
@@ -44,12 +43,20 @@ def custom_scaled_dot_product_attention(
         isinstance(query, torch.Tensor)
         and query.is_cuda
         and query.ndim == 4
-        and query.shape[-1] in (64, 128)
         and query.shape[2] == key.shape[2]
-        and query.shape[1] % key.shape[1] == 0
+        and query.shape[2] > 1
         and dropout_p == 0.0
     ):
-        return TritonCausalAttentionFunction.apply(query, key, value, True)
+        attn_mask = None
+        is_causal = True
+    elif (
+        attn_mask is not None
+        and isinstance(attn_mask, torch.Tensor)
+        and attn_mask.is_floating_point()
+        and attn_mask.dtype != query.dtype
+    ):
+        attn_mask = attn_mask.to(query.dtype)
+
     if enable_gqa:
         return _orig_F_sdpa(
             query,
@@ -320,79 +327,16 @@ def apply(model=None):
             if isinstance(fwd_globals, dict) and "apply_rotary_pos_emb" in fwd_globals:
                 fwd_globals["apply_rotary_pos_emb"] = custom_apply_rotary_pos_emb
 
-        # 3b. Fused Causal Attention (GQA + Flash-style Online Softmax on Triton)
+        # Restore native SDPA in ALL_ATTENTION_FUNCTIONS if previously patched
         attn_funcs = getattr(modeling_qwen2, "ALL_ATTENTION_FUNCTIONS", None)
-        if attn_funcs is not None and "sdpa" in attn_funcs:
-            _orig_sdpa_attn_fwd = getattr(
-                modeling_qwen2, "_orig_sdpa_attn_fwd", attn_funcs["sdpa"]
-            )
-            modeling_qwen2._orig_sdpa_attn_fwd = _orig_sdpa_attn_fwd
-
-            def custom_sdpa_attention_forward(
-                module,
-                query,
-                key,
-                value,
-                attention_mask,
-                dropout=0.0,
-                scaling=None,
-                is_causal=None,
-                **kwargs,
-            ):
-                if (
-                    isinstance(query, torch.Tensor)
-                    and query.is_cuda
-                    and query.ndim == 4
-                    and query.shape[-1] in (64, 128)
-                    and query.shape[2] == key.shape[2]
-                    and query.shape[1] % key.shape[1] == 0
-                    and dropout == 0.0
-                    and not kwargs.get("output_attentions", False)
-                ):
-                    attn_output = TritonCausalAttentionFunction.apply(query, key, value, True)
-                    return attn_output.transpose(1, 2).contiguous(), None
-                return _orig_sdpa_attn_fwd(
-                    module,
-                    query,
-                    key,
-                    value,
-                    attention_mask,
-                    dropout=dropout,
-                    scaling=scaling,
-                    is_causal=is_causal,
-                    **kwargs,
-                )
-
-            attn_funcs["sdpa"] = custom_sdpa_attention_forward
+        if attn_funcs is not None and hasattr(modeling_qwen2, "_orig_sdpa_attn_fwd"):
+            attn_funcs["sdpa"] = modeling_qwen2._orig_sdpa_attn_fwd
             try:
                 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS as global_attn_funcs
 
-                global_attn_funcs["sdpa"] = custom_sdpa_attention_forward
+                global_attn_funcs["sdpa"] = modeling_qwen2._orig_sdpa_attn_fwd
             except Exception:
                 pass
-        elif hasattr(modeling_qwen2, "Qwen2SdpaAttention"):
-            _orig_repeat_kv = getattr(
-                modeling_qwen2, "_orig_repeat_kv", getattr(modeling_qwen2, "repeat_kv", None)
-            )
-            if _orig_repeat_kv is not None:
-                modeling_qwen2._orig_repeat_kv = _orig_repeat_kv
-
-                def custom_repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
-                    if (
-                        isinstance(hidden_states, torch.Tensor)
-                        and hidden_states.is_cuda
-                        and hidden_states.ndim == 4
-                        and hidden_states.shape[-1] in (64, 128)
-                    ):
-                        return hidden_states
-                    return _orig_repeat_kv(hidden_states, n_rep)
-
-                modeling_qwen2.repeat_kv = custom_repeat_kv
-                sdpa_globals = getattr(
-                    modeling_qwen2.Qwen2SdpaAttention.forward, "__globals__", None
-                )
-                if isinstance(sdpa_globals, dict) and "repeat_kv" in sdpa_globals:
-                    sdpa_globals["repeat_kv"] = custom_repeat_kv
 
         # 4. Fused Add + RMSNorm in Qwen2DecoderLayer
         if hasattr(modeling_qwen2, "Qwen2DecoderLayer"):
@@ -442,8 +386,6 @@ def apply(model=None):
                     mlp_dtype,
                 )
                 hidden_states = self.mlp(hidden_states)
-                if hidden_states.dtype != residual.dtype:
-                    hidden_states = hidden_states.to(residual.dtype)
                 hidden_states = residual + hidden_states
                 if hidden_states.dtype != orig_dtype:
                     hidden_states = hidden_states.to(orig_dtype)
@@ -486,13 +428,20 @@ def apply(model=None):
     except Exception:
         pass
 
-    # 6. Patch functional.scaled_dot_product_attention, functional.cross_entropy, and nn.CrossEntropyLoss.forward
+    # 6. Native F.scaled_dot_product_attention (fp16 causal fast-path) & Custom Cross-Entropy
     torch.nn.functional.scaled_dot_product_attention = custom_scaled_dot_product_attention
     F.scaled_dot_product_attention = custom_scaled_dot_product_attention
     torch.nn.functional.cross_entropy = custom_cross_entropy
     F.cross_entropy = custom_cross_entropy
     nn.CrossEntropyLoss.forward = custom_ce_forward
 
-    # 7. Patch model instance loss_function / loss_fct if provided
+    # 7. Configure model instance if provided
     if model is not None:
+        if hasattr(model, "gradient_checkpointing_enable"):
+            try:
+                model.gradient_checkpointing_enable(
+                    gradient_checkpointing_kwargs={"use_reentrant": False}
+                )
+            except Exception:
+                pass
         _patch_model_loss_attributes(model)
