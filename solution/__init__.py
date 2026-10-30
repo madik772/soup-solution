@@ -1,8 +1,9 @@
+import inspect
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from solution.rmsnorm import TritonRMSNormFunction
-from solution.cross_entropy import TritonCrossEntropyFunction
+from solution.rmsnorm import TritonRMSNormFunction, TritonFusedAddRMSNormFunction
+from solution.cross_entropy import TritonCrossEntropyFunction, ChunkedCrossEntropyFunction
 from solution.swiglu import TritonSwiGLUFunction
 from solution.rope import TritonRoPEFunction
 
@@ -90,7 +91,6 @@ def custom_model_loss_function(
     if vocab_size is None and shift_labels is None and num_items_in_batch is None:
         return custom_cross_entropy(logits, labels, ignore_index=ignore_index)
 
-    logits = logits.float()
     if shift_labels is None:
         labels = F.pad(labels, (0, 1), value=ignore_index)
         shift_labels = labels[..., 1:].contiguous()
@@ -142,10 +142,10 @@ def _patch_model_loss_attributes(model):
 
 
 def apply(model=None):
-    # 1. Подменяем Qwen2RMSNorm, Qwen2MLP и apply_rotary_pos_emb на кастомные Triton-функции
     try:
         from transformers.models.qwen2 import modeling_qwen2
 
+        # 1. RMSNorm
         _orig_rmsnorm_forward = getattr(
             modeling_qwen2.Qwen2RMSNorm,
             "_orig_forward",
@@ -164,6 +164,7 @@ def apply(model=None):
 
         modeling_qwen2.Qwen2RMSNorm.forward = custom_rmsnorm_forward
 
+        # 2. SwiGLU MLP
         _orig_mlp_forward = getattr(
             modeling_qwen2.Qwen2MLP,
             "_orig_forward",
@@ -179,6 +180,7 @@ def apply(model=None):
 
         modeling_qwen2.Qwen2MLP.forward = custom_mlp_forward
 
+        # 3. Fused RoPE
         _orig_apply_rotary_pos_emb = getattr(
             modeling_qwen2,
             "_orig_apply_rotary_pos_emb",
@@ -204,14 +206,144 @@ def apply(model=None):
             fwd_globals = getattr(modeling_qwen2.Qwen2Attention.forward, "__globals__", None)
             if isinstance(fwd_globals, dict) and "apply_rotary_pos_emb" in fwd_globals:
                 fwd_globals["apply_rotary_pos_emb"] = custom_apply_rotary_pos_emb
+
+        # 4. Fused Add + RMSNorm in Qwen2DecoderLayer
+        if hasattr(modeling_qwen2, "Qwen2DecoderLayer"):
+            _orig_decoder_layer_forward = getattr(
+                modeling_qwen2.Qwen2DecoderLayer,
+                "_orig_forward",
+                modeling_qwen2.Qwen2DecoderLayer.forward,
+            )
+            modeling_qwen2.Qwen2DecoderLayer._orig_forward = _orig_decoder_layer_forward
+
+            _dec_src = ""
+            try:
+                _dec_src = inspect.getsource(_orig_decoder_layer_forward)
+            except Exception:
+                pass
+            _dec_returns_tuple = (
+                "return outputs" in _dec_src or "outputs = (hidden_states" in _dec_src
+            )
+
+            def custom_decoder_layer_forward(self, hidden_states: torch.Tensor, *args, **kwargs):
+                if not hidden_states.is_cuda or kwargs.get("output_attentions", False):
+                    return _orig_decoder_layer_forward(self, hidden_states, *args, **kwargs)
+
+                residual = hidden_states
+                hidden_states = self.input_layernorm(hidden_states)
+
+                attn_outputs = self.self_attn(hidden_states, *args, **kwargs)
+                if isinstance(attn_outputs, tuple):
+                    hidden_states = attn_outputs[0]
+                    rest = attn_outputs[1:]
+                else:
+                    hidden_states = attn_outputs
+                    rest = ()
+
+                hidden_states, residual = TritonFusedAddRMSNormFunction.apply(
+                    residual,
+                    hidden_states,
+                    self.post_attention_layernorm.weight,
+                    self.post_attention_layernorm.variance_epsilon,
+                )
+                hidden_states = self.mlp(hidden_states)
+                hidden_states = residual + hidden_states
+
+                if _dec_returns_tuple:
+                    outputs = (hidden_states,)
+                    if kwargs.get("use_cache", False) and rest:
+                        outputs += rest
+                    return outputs
+                return hidden_states
+
+            modeling_qwen2.Qwen2DecoderLayer.forward = custom_decoder_layer_forward
+
+        # 5. Chunked Cross-Entropy in Qwen2ForCausalLM.forward
+        if hasattr(modeling_qwen2, "Qwen2ForCausalLM"):
+            _orig_causal_lm_forward = getattr(
+                modeling_qwen2.Qwen2ForCausalLM,
+                "_orig_forward",
+                modeling_qwen2.Qwen2ForCausalLM.forward,
+            )
+            modeling_qwen2.Qwen2ForCausalLM._orig_forward = _orig_causal_lm_forward
+
+            def custom_causal_lm_forward(self, *args, **kwargs):
+                if not torch.is_grad_enabled():
+                    return _orig_causal_lm_forward(self, *args, **kwargs)
+
+                orig_lm_head_forward = self.lm_head.forward
+                orig_loss_function = self.loss_function
+                captured = {}
+
+                def hooked_lm_head_forward(h):
+                    if h.is_cuda and h.requires_grad and kwargs.get("labels", None) is not None:
+                        captured["hidden_states"] = h
+                        captured["weight"] = self.lm_head.weight
+                        with torch.no_grad():
+                            return orig_lm_head_forward(h.detach())
+                    return orig_lm_head_forward(h)
+
+                def hooked_loss_function(
+                    logits=None,
+                    labels=None,
+                    vocab_size=None,
+                    num_items_in_batch=None,
+                    ignore_index=-100,
+                    shift_labels=None,
+                    **loss_kwargs,
+                ):
+                    h = captured.get("hidden_states", None)
+                    w = captured.get("weight", None)
+                    if h is not None and w is not None and h.is_cuda and labels is not None:
+                        if shift_labels is None:
+                            padded_labels = F.pad(labels, (0, 1), value=ignore_index)
+                            shift_labels = padded_labels[..., 1:].contiguous()
+                        shift_labels_1d = shift_labels.view(-1).to(h.device)
+                        h_2d = h.reshape(-1, h.shape[-1])
+                        if h_2d.shape[0] == shift_labels_1d.shape[0]:
+                            reduction = "sum" if num_items_in_batch is not None else "mean"
+                            loss = ChunkedCrossEntropyFunction.apply(
+                                h,
+                                w,
+                                shift_labels_1d,
+                                ignore_index,
+                                1024,
+                                reduction,
+                                logits,
+                            )
+                            if reduction == "sum":
+                                if torch.is_tensor(num_items_in_batch):
+                                    num_items_in_batch = num_items_in_batch.to(loss.device)
+                                loss = loss / num_items_in_batch
+                            return loss
+                    return custom_model_loss_function(
+                        logits=logits,
+                        labels=labels,
+                        vocab_size=vocab_size,
+                        num_items_in_batch=num_items_in_batch,
+                        ignore_index=ignore_index,
+                        shift_labels=shift_labels,
+                        **loss_kwargs,
+                    )
+
+                self.lm_head.forward = hooked_lm_head_forward
+                self.loss_function = hooked_loss_function
+                try:
+                    return _orig_causal_lm_forward(self, *args, **kwargs)
+                finally:
+                    self.lm_head.forward = orig_lm_head_forward
+                    self.loss_function = orig_loss_function
+                    captured.clear()
+
+            modeling_qwen2.Qwen2ForCausalLM.forward = custom_causal_lm_forward
     except Exception:
         pass
 
-    # 2. Активируем подмену functional.cross_entropy и nn.CrossEntropyLoss.forward
+    # 6. Активируем подмену functional.cross_entropy и nn.CrossEntropyLoss.forward
     torch.nn.functional.cross_entropy = custom_cross_entropy
     F.cross_entropy = custom_cross_entropy
     nn.CrossEntropyLoss.forward = custom_ce_forward
 
-    # 3. Если передан model, обновляем атрибуты loss_function / loss_fct
+    # 7. Если передан model, обновляем атрибуты loss_function / loss_fct
     if model is not None:
         _patch_model_loss_attributes(model)

@@ -51,6 +51,85 @@ def _custom_rmsnorm_bwd_kernel(
     tl.store(dX + row_idx * stride_dx_row + cols, dx.to(dX.dtype.element_ty), mask=mask)
 
 
+@triton.jit
+def _custom_fused_add_rmsnorm_fwd_kernel(
+    Res, X, W, ResOut, Y, Rsqrt,
+    stride_res_row, stride_x_row, stride_res_out_row, stride_y_row,
+    N, eps,
+    BLOCK_SIZE: tl.constexpr,
+):
+    row_idx = tl.program_id(0).to(tl.int64)
+    res_row_ptr = Res + row_idx * stride_res_row
+    x_row_ptr = X + row_idx * stride_x_row
+    res_out_row_ptr = ResOut + row_idx * stride_res_out_row
+    y_row_ptr = Y + row_idx * stride_y_row
+
+    var_sum = 0.0
+    for off in range(0, N, BLOCK_SIZE):
+        cols = off + tl.arange(0, BLOCK_SIZE)
+        mask = cols < N
+        res = tl.load(res_row_ptr + cols, mask=mask, other=0.0).to(tl.float32)
+        x = tl.load(x_row_ptr + cols, mask=mask, other=0.0).to(tl.float32)
+        sum_res = res + x
+        tl.store(res_out_row_ptr + cols, sum_res.to(ResOut.dtype.element_ty), mask=mask)
+        var_sum += tl.sum(sum_res * sum_res, axis=0)
+
+    var = var_sum / N
+    rsqrt = tl.rsqrt(var + eps)
+    tl.store(Rsqrt + row_idx, rsqrt)
+
+    for off in range(0, N, BLOCK_SIZE):
+        cols = off + tl.arange(0, BLOCK_SIZE)
+        mask = cols < N
+        sum_res = tl.load(res_out_row_ptr + cols, mask=mask, other=0.0).to(tl.float32)
+        w = tl.load(W + cols, mask=mask, other=0.0).to(tl.float32)
+        out = (sum_res * rsqrt * w).to(Y.dtype.element_ty)
+        tl.store(y_row_ptr + cols, out, mask=mask)
+
+
+@triton.jit
+def _custom_fused_add_rmsnorm_bwd_kernel(
+    dY, dResOut, ResOut, W, Rsqrt, dSumRes,
+    stride_dy_row, stride_dres_out_row, stride_res_out_row, stride_dsum_row,
+    N,
+    HAS_DRES: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    row_idx = tl.program_id(0).to(tl.int64)
+    dy_row_ptr = dY + row_idx * stride_dy_row
+    res_out_row_ptr = ResOut + row_idx * stride_res_out_row
+    dsum_row_ptr = dSumRes + row_idx * stride_dsum_row
+    rsqrt = tl.load(Rsqrt + row_idx)
+
+    dot_sum = 0.0
+    for off in range(0, N, BLOCK_SIZE):
+        cols = off + tl.arange(0, BLOCK_SIZE)
+        mask = cols < N
+        dy = tl.load(dy_row_ptr + cols, mask=mask, other=0.0).to(tl.float32)
+        sum_res = tl.load(res_out_row_ptr + cols, mask=mask, other=0.0).to(tl.float32)
+        w = tl.load(W + cols, mask=mask, other=0.0).to(tl.float32)
+        dot_sum += tl.sum(dy * w * sum_res, axis=0)
+
+    c1 = dot_sum / N
+
+    for off in range(0, N, BLOCK_SIZE):
+        cols = off + tl.arange(0, BLOCK_SIZE)
+        mask = cols < N
+        dy = tl.load(dy_row_ptr + cols, mask=mask, other=0.0).to(tl.float32)
+        sum_res = tl.load(res_out_row_ptr + cols, mask=mask, other=0.0).to(tl.float32)
+        w = tl.load(W + cols, mask=mask, other=0.0).to(tl.float32)
+        dy_w = dy * w
+        d_sum = rsqrt * (dy_w - sum_res * (rsqrt * rsqrt * c1))
+        if HAS_DRES:
+            dres = tl.load(
+                dResOut + row_idx * stride_dres_out_row + cols,
+                mask=mask,
+                other=0.0,
+            ).to(tl.float32)
+            d_sum = d_sum + dres
+        tl.store(dsum_row_ptr + cols, d_sum.to(dSumRes.dtype.element_ty), mask=mask)
+
+
 class TritonRMSNormFunction(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x, weight, eps=1e-6):
@@ -78,7 +157,7 @@ class TritonRMSNormFunction(torch.autograd.Function):
         x_2d, weight, rsqrt = ctx.saved_tensors
         orig_shape = dy.shape
         dy_2d = dy.contiguous().reshape(-1, orig_shape[-1])
-        M, N = dy_2d.shape
+        M, _ = dy_2d.shape
         dx = torch.empty_like(x_2d)
 
         _custom_rmsnorm_bwd_kernel[(M,)](
@@ -93,3 +172,72 @@ class TritonRMSNormFunction(torch.autograd.Function):
 
         dw = (dy_2d.float() * (x_2d.float() * rsqrt.unsqueeze(1))).sum(dim=0).to(weight.dtype)
         return dx.reshape(*orig_shape), dw, None
+
+
+class TritonFusedAddRMSNormFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, residual, x, weight, eps=1e-6):
+        ctx.set_materialize_grads(False)
+        orig_shape = x.shape
+        res_2d = residual.contiguous().reshape(-1, orig_shape[-1])
+        x_2d = x.to(res_2d.dtype).contiguous().reshape(-1, orig_shape[-1])
+        M, N = x_2d.shape
+
+        res_out_2d = torch.empty_like(res_2d)
+        y_2d = torch.empty_like(x_2d)
+        rsqrt = torch.empty(M, device=x.device, dtype=torch.float32)
+
+        BLOCK_SIZE = 1024
+        _custom_fused_add_rmsnorm_fwd_kernel[(M,)](
+            res_2d, x_2d, weight, res_out_2d, y_2d, rsqrt,
+            res_2d.stride(0), x_2d.stride(0), res_out_2d.stride(0), y_2d.stride(0),
+            N, eps,
+            BLOCK_SIZE=BLOCK_SIZE,
+            num_warps=4,
+        )
+        ctx.save_for_backward(res_out_2d, weight, rsqrt)
+        ctx.orig_shape = orig_shape
+        ctx.N = N
+        ctx.BLOCK_SIZE = BLOCK_SIZE
+        return y_2d.reshape(*orig_shape), res_out_2d.reshape(*orig_shape)
+
+    @staticmethod
+    def backward(ctx, dy, d_res_out):
+        res_out_2d, weight, rsqrt = ctx.saved_tensors
+        orig_shape = ctx.orig_shape
+        M, N = res_out_2d.shape
+
+        if dy is None:
+            dy_2d = torch.zeros_like(res_out_2d)
+        else:
+            dy_2d = dy.to(res_out_2d.dtype).contiguous().reshape(M, N)
+
+        has_dres = d_res_out is not None
+        if has_dres:
+            dres_2d = d_res_out.to(res_out_2d.dtype).contiguous().reshape(M, N)
+            dres_stride = dres_2d.stride(0)
+        else:
+            dres_2d = res_out_2d
+            dres_stride = 0
+
+        d_sum_2d = torch.empty_like(res_out_2d)
+
+        _custom_fused_add_rmsnorm_bwd_kernel[(M,)](
+            dy_2d, dres_2d, res_out_2d, weight, rsqrt, d_sum_2d,
+            dy_2d.stride(0), dres_stride, res_out_2d.stride(0), d_sum_2d.stride(0),
+            N,
+            HAS_DRES=has_dres,
+            BLOCK_SIZE=ctx.BLOCK_SIZE,
+            num_warps=4,
+        )
+
+        d_sum = d_sum_2d.reshape(*orig_shape)
+        if weight is None or weight.requires_grad is False:
+            return d_sum, d_sum, None, None
+
+        dw = (dy_2d.float() * (res_out_2d.float() * rsqrt.unsqueeze(1))).sum(dim=0).to(weight.dtype)
+        return d_sum, d_sum, dw, None
+
+
+def fused_add_rmsnorm(residual, x, weight, eps=1e-6):
+    return TritonFusedAddRMSNormFunction.apply(residual, x, weight, eps)

@@ -73,6 +73,48 @@ def test_rmsnorm_matches_pytorch(dtype, weight_grad):
 
 @needs_cuda
 @pytest.mark.parametrize("dtype", [torch.float16, torch.float32])
+@pytest.mark.parametrize("weight_grad", [False, True])
+def test_fused_add_rmsnorm_matches_pytorch(dtype, weight_grad):
+    from solution.rmsnorm import TritonFusedAddRMSNormFunction
+
+    torch.manual_seed(0)
+    shape = (4, 128, 1536)
+    eps = 1e-6
+    res = torch.randn(shape, device="cuda", dtype=dtype, requires_grad=True)
+    x = torch.randn(shape, device="cuda", dtype=dtype, requires_grad=True)
+    w = torch.randn(shape[-1], device="cuda", dtype=dtype, requires_grad=weight_grad)
+    dy = torch.randn(shape, device="cuda", dtype=dtype)
+    dres_out = torch.randn(shape, device="cuda", dtype=dtype)
+
+    sum_ref = (res + x).float()
+    var = sum_ref.pow(2).mean(-1, keepdim=True)
+    y_ref = (sum_ref * torch.rsqrt(var + eps) * w.float()).to(dtype)
+    loss_ref = (y_ref.float() * dy.float() + sum_ref * dres_out.float()).sum()
+    loss_ref.backward()
+    ref_dres = res.grad.float().clone()
+    ref_dx = x.grad.float().clone()
+    ref_dw = w.grad.float().clone() if weight_grad else None
+    res.grad = x.grad = None
+    if weight_grad:
+        w.grad = None
+
+    y_out, res_out = TritonFusedAddRMSNormFunction.apply(res, x, w, eps)
+    loss_out = (y_out.float() * dy.float() + res_out.float() * dres_out.float()).sum()
+    loss_out.backward()
+
+    tol = TOLERANCE[dtype]
+    torch.testing.assert_close(y_out.float(), y_ref.float(), rtol=tol, atol=tol)
+    torch.testing.assert_close(res_out.float(), sum_ref, rtol=tol, atol=tol)
+    torch.testing.assert_close(res.grad.float(), ref_dres, rtol=tol, atol=tol)
+    torch.testing.assert_close(x.grad.float(), ref_dx, rtol=tol, atol=tol)
+    if weight_grad:
+        torch.testing.assert_close(w.grad.float(), ref_dw, rtol=tol, atol=tol)
+    else:
+        assert w.grad is None
+
+
+@needs_cuda
+@pytest.mark.parametrize("dtype", [torch.float16, torch.float32])
 @pytest.mark.parametrize("layout", ["bshd", "bhsd"])
 def test_rope_matches_pytorch(dtype, layout):
     from solution.rope import TritonRoPEFunction
@@ -146,6 +188,33 @@ def test_cross_entropy_matches_pytorch(dtype, ndim):
     tol = TOLERANCE[dtype]
     torch.testing.assert_close(loss.float(), ref_loss.float(), rtol=tol, atol=tol)
     torch.testing.assert_close(logits.grad.float(), ref_grad, rtol=tol, atol=tol)
+
+
+@needs_cuda
+@pytest.mark.parametrize("dtype", [torch.float16, torch.float32])
+def test_chunked_cross_entropy_matches_pytorch(dtype):
+    import solution
+    from solution.cross_entropy import ChunkedCrossEntropyFunction
+
+    torch.manual_seed(0)
+    N, D, V = 1500, 256, 16384
+    h = torch.randn((N, D), device="cuda", dtype=dtype, requires_grad=True)
+    w = torch.randn((V, D), device="cuda", dtype=dtype, requires_grad=False)
+    targets = torch.randint(0, V, (N,), device="cuda", dtype=torch.long)
+    targets[::7] = -100
+
+    ref_h = h.detach().float().requires_grad_(True)
+    ref_logits = torch.matmul(ref_h, w.float().t())
+    ref_loss = solution._orig_F_cross_entropy(ref_logits, targets, ignore_index=-100, reduction="mean")
+    ref_loss.backward()
+    ref_dh = ref_h.grad.clone()
+
+    loss = ChunkedCrossEntropyFunction.apply(h, w, targets, -100, 1024, "mean", None)
+    loss.backward()
+
+    tol = TOLERANCE[dtype]
+    torch.testing.assert_close(loss.float(), ref_loss.float(), rtol=tol, atol=tol)
+    torch.testing.assert_close(h.grad.float(), ref_dh, rtol=tol, atol=tol)
 
 
 def test_apply_patches_cross_entropy_and_model():

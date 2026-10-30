@@ -24,7 +24,12 @@ REPO_ROOT = Path(__file__).resolve().parent
 
 EXPECTED_KERNELS = {
     "swiglu.py": {"_custom_fused_swiglu_fwd_kernel", "_custom_fused_swiglu_bwd_kernel"},
-    "rmsnorm.py": {"_custom_rmsnorm_fwd_kernel", "_custom_rmsnorm_bwd_kernel"},
+    "rmsnorm.py": {
+        "_custom_rmsnorm_fwd_kernel",
+        "_custom_rmsnorm_bwd_kernel",
+        "_custom_fused_add_rmsnorm_fwd_kernel",
+        "_custom_fused_add_rmsnorm_bwd_kernel",
+    },
     "cross_entropy.py": {"_custom_ce_fwd_kernel", "_custom_ce_bwd_kernel"},
     "rope.py": {"_custom_fused_rope_fwd_kernel", "_custom_fused_rope_bwd_kernel"},
 }
@@ -151,7 +156,7 @@ def sync_git_repo() -> None:
     if changes:
         print("Detected changes:\n" + changes)
         subprocess.run(["git", "add", "."], cwd=REPO_ROOT, check=True)
-        commit_msg = f"Add fused RoPE, SwiGLU, RMSNorm, CrossEntropy Triton kernels ({time.strftime('%Y-%m-%d %H:%M:%S')})"
+        commit_msg = f"Stage 3: Fused Add+RMSNorm and Chunked Cross-Entropy ({time.strftime('%Y-%m-%d %H:%M:%S')})"
         subprocess.run(["git", "commit", "-m", commit_msg], cwd=REPO_ROOT, check=False)
 
     print("Pushing to origin main...")
