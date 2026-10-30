@@ -3,6 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from solution.rmsnorm import TritonRMSNormFunction
 from solution.cross_entropy import TritonCrossEntropyFunction
+from solution.swiglu import TritonSwiGLUFunction
 
 _orig_F_cross_entropy = getattr(F, "_orig_cross_entropy", F.cross_entropy)
 F._orig_cross_entropy = _orig_F_cross_entropy
@@ -140,7 +141,7 @@ def _patch_model_loss_attributes(model):
 
 
 def apply(model=None):
-    # 1. Подменяем Qwen2RMSNorm.forward на TritonRMSNormFunction
+    # 1. Подменяем Qwen2RMSNorm.forward и Qwen2MLP.forward на кастомные Triton-функции
     try:
         from transformers.models.qwen2 import modeling_qwen2
 
@@ -161,6 +162,21 @@ def apply(model=None):
             )
 
         modeling_qwen2.Qwen2RMSNorm.forward = custom_rmsnorm_forward
+
+        _orig_mlp_forward = getattr(
+            modeling_qwen2.Qwen2MLP,
+            "_orig_forward",
+            modeling_qwen2.Qwen2MLP.forward,
+        )
+        modeling_qwen2.Qwen2MLP._orig_forward = _orig_mlp_forward
+
+        def custom_mlp_forward(self, x):
+            act = getattr(getattr(self, "config", None), "hidden_act", "silu")
+            if act != "silu" or not x.is_cuda:
+                return _orig_mlp_forward(self, x)
+            return self.down_proj(TritonSwiGLUFunction.apply(self.gate_proj(x), self.up_proj(x)))
+
+        modeling_qwen2.Qwen2MLP.forward = custom_mlp_forward
     except Exception:
         pass
 
