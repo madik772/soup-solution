@@ -16,24 +16,23 @@ def _custom_rmsnorm_fwd_kernel(
     x_row_ptr = X + row_idx * stride_x_row
     y_row_ptr = Y + row_idx * stride_y_row
 
-    var_sum = 0.0
-    for off in range(0, N, BLOCK_SIZE):
-        cols = off + tl.arange(0, BLOCK_SIZE)
-        mask = cols < N
-        x = tl.load(x_row_ptr + cols, mask=mask, other=0.0).to(tl.float32)
-        var_sum += tl.sum(x * x, axis=0)
+    cols0 = tl.arange(0, BLOCK_SIZE)
+    mask0 = cols0 < N
+    x0 = tl.load(x_row_ptr + cols0, mask=mask0, other=0.0).to(tl.float32)
 
-    var = var_sum / N
+    cols1 = BLOCK_SIZE + cols0
+    mask1 = cols1 < N
+    x1 = tl.load(x_row_ptr + cols1, mask=mask1, other=0.0).to(tl.float32)
+
+    var = (tl.sum(x0 * x0, axis=0) + tl.sum(x1 * x1, axis=0)) / N
     rsqrt = tl.rsqrt(var + eps)
     tl.store(Rsqrt + row_idx, rsqrt)
 
-    for off in range(0, N, BLOCK_SIZE):
-        cols = off + tl.arange(0, BLOCK_SIZE)
-        mask = cols < N
-        x = tl.load(x_row_ptr + cols, mask=mask, other=0.0).to(tl.float32)
-        w = tl.load(W + cols, mask=mask, other=0.0).to(tl.float32)
-        out = (x * rsqrt * w).to(Y.dtype.element_ty)
-        tl.store(y_row_ptr + cols, out, mask=mask)
+    w0 = tl.load(W + cols0, mask=mask0, other=0.0).to(tl.float32)
+    w1 = tl.load(W + cols1, mask=mask1, other=0.0).to(tl.float32)
+
+    tl.store(y_row_ptr + cols0, (x0 * rsqrt * w0).to(Y.dtype.element_ty), mask=mask0)
+    tl.store(y_row_ptr + cols1, (x1 * rsqrt * w1).to(Y.dtype.element_ty), mask=mask1)
 
 
 @triton.jit
@@ -49,26 +48,28 @@ def _custom_rmsnorm_bwd_kernel(
     dx_row_ptr = dX + row_idx * stride_dx_row
     rsqrt = tl.load(Rsqrt + row_idx)
 
-    dot_sum = 0.0
-    for off in range(0, N, BLOCK_SIZE):
-        cols = off + tl.arange(0, BLOCK_SIZE)
-        mask = cols < N
-        dy = tl.load(dy_row_ptr + cols, mask=mask, other=0.0).to(tl.float32)
-        x = tl.load(x_row_ptr + cols, mask=mask, other=0.0).to(tl.float32)
-        w = tl.load(W + cols, mask=mask, other=0.0).to(tl.float32)
-        dot_sum += tl.sum(dy * w * x, axis=0)
+    cols0 = tl.arange(0, BLOCK_SIZE)
+    mask0 = cols0 < N
+    dy0 = tl.load(dy_row_ptr + cols0, mask=mask0, other=0.0).to(tl.float32)
+    x0 = tl.load(x_row_ptr + cols0, mask=mask0, other=0.0).to(tl.float32)
+    w0 = tl.load(W + cols0, mask=mask0, other=0.0).to(tl.float32)
+    dy_w0 = dy0 * w0
 
-    c1 = dot_sum / N
+    cols1 = BLOCK_SIZE + cols0
+    mask1 = cols1 < N
+    dy1 = tl.load(dy_row_ptr + cols1, mask=mask1, other=0.0).to(tl.float32)
+    x1 = tl.load(x_row_ptr + cols1, mask=mask1, other=0.0).to(tl.float32)
+    w1 = tl.load(W + cols1, mask=mask1, other=0.0).to(tl.float32)
+    dy_w1 = dy1 * w1
 
-    for off in range(0, N, BLOCK_SIZE):
-        cols = off + tl.arange(0, BLOCK_SIZE)
-        mask = cols < N
-        dy = tl.load(dy_row_ptr + cols, mask=mask, other=0.0).to(tl.float32)
-        x = tl.load(x_row_ptr + cols, mask=mask, other=0.0).to(tl.float32)
-        w = tl.load(W + cols, mask=mask, other=0.0).to(tl.float32)
-        dy_w = dy * w
-        dx = rsqrt * (dy_w - x * (rsqrt * rsqrt * c1))
-        tl.store(dx_row_ptr + cols, dx.to(dX.dtype.element_ty), mask=mask)
+    c1 = (tl.sum(dy_w0 * x0, axis=0) + tl.sum(dy_w1 * x1, axis=0)) / N
+    scale = rsqrt * rsqrt * c1
+
+    dx0 = rsqrt * (dy_w0 - x0 * scale)
+    dx1 = rsqrt * (dy_w1 - x1 * scale)
+
+    tl.store(dx_row_ptr + cols0, dx0.to(dX.dtype.element_ty), mask=mask0)
+    tl.store(dx_row_ptr + cols1, dx1.to(dX.dtype.element_ty), mask=mask1)
 
 
 @triton.jit
@@ -84,27 +85,29 @@ def _custom_fused_add_rmsnorm_fwd_kernel(
     res_out_row_ptr = ResOut + row_idx * stride_res_out_row
     y_row_ptr = Y + row_idx * stride_y_row
 
-    var_sum = 0.0
-    for off in range(0, N, BLOCK_SIZE):
-        cols = off + tl.arange(0, BLOCK_SIZE)
-        mask = cols < N
-        res = tl.load(res_row_ptr + cols, mask=mask, other=0.0).to(tl.float32)
-        x = tl.load(x_row_ptr + cols, mask=mask, other=0.0).to(tl.float32)
-        sum_res = res + x
-        tl.store(res_out_row_ptr + cols, sum_res.to(ResOut.dtype.element_ty), mask=mask)
-        var_sum += tl.sum(sum_res * sum_res, axis=0)
+    cols0 = tl.arange(0, BLOCK_SIZE)
+    mask0 = cols0 < N
+    res0 = tl.load(res_row_ptr + cols0, mask=mask0, other=0.0).to(tl.float32)
+    x0 = tl.load(x_row_ptr + cols0, mask=mask0, other=0.0).to(tl.float32)
+    sum0 = res0 + x0
+    tl.store(res_out_row_ptr + cols0, sum0.to(ResOut.dtype.element_ty), mask=mask0)
 
-    var = var_sum / N
+    cols1 = BLOCK_SIZE + cols0
+    mask1 = cols1 < N
+    res1 = tl.load(res_row_ptr + cols1, mask=mask1, other=0.0).to(tl.float32)
+    x1 = tl.load(x_row_ptr + cols1, mask=mask1, other=0.0).to(tl.float32)
+    sum1 = res1 + x1
+    tl.store(res_out_row_ptr + cols1, sum1.to(ResOut.dtype.element_ty), mask=mask1)
+
+    var = (tl.sum(sum0 * sum0, axis=0) + tl.sum(sum1 * sum1, axis=0)) / N
     rsqrt = tl.rsqrt(var + eps)
     tl.store(Rsqrt + row_idx, rsqrt)
 
-    for off in range(0, N, BLOCK_SIZE):
-        cols = off + tl.arange(0, BLOCK_SIZE)
-        mask = cols < N
-        sum_res = tl.load(res_out_row_ptr + cols, mask=mask, other=0.0).to(tl.float32)
-        w = tl.load(W + cols, mask=mask, other=0.0).to(tl.float32)
-        out = (sum_res * rsqrt * w).to(Y.dtype.element_ty)
-        tl.store(y_row_ptr + cols, out, mask=mask)
+    w0 = tl.load(W + cols0, mask=mask0, other=0.0).to(tl.float32)
+    w1 = tl.load(W + cols1, mask=mask1, other=0.0).to(tl.float32)
+
+    tl.store(y_row_ptr + cols0, (sum0 * rsqrt * w0).to(Y.dtype.element_ty), mask=mask0)
+    tl.store(y_row_ptr + cols1, (sum1 * rsqrt * w1).to(Y.dtype.element_ty), mask=mask1)
 
 
 @triton.jit
@@ -121,33 +124,35 @@ def _custom_fused_add_rmsnorm_bwd_kernel(
     dsum_row_ptr = dSumRes + row_idx * stride_dsum_row
     rsqrt = tl.load(Rsqrt + row_idx)
 
-    dot_sum = 0.0
-    for off in range(0, N, BLOCK_SIZE):
-        cols = off + tl.arange(0, BLOCK_SIZE)
-        mask = cols < N
-        dy = tl.load(dy_row_ptr + cols, mask=mask, other=0.0).to(tl.float32)
-        sum_res = tl.load(res_out_row_ptr + cols, mask=mask, other=0.0).to(tl.float32)
-        w = tl.load(W + cols, mask=mask, other=0.0).to(tl.float32)
-        dot_sum += tl.sum(dy * w * sum_res, axis=0)
+    cols0 = tl.arange(0, BLOCK_SIZE)
+    mask0 = cols0 < N
+    dy0 = tl.load(dy_row_ptr + cols0, mask=mask0, other=0.0).to(tl.float32)
+    sum0 = tl.load(res_out_row_ptr + cols0, mask=mask0, other=0.0).to(tl.float32)
+    w0 = tl.load(W + cols0, mask=mask0, other=0.0).to(tl.float32)
+    dy_w0 = dy0 * w0
 
-    c1 = dot_sum / N
+    cols1 = BLOCK_SIZE + cols0
+    mask1 = cols1 < N
+    dy1 = tl.load(dy_row_ptr + cols1, mask=mask1, other=0.0).to(tl.float32)
+    sum1 = tl.load(res_out_row_ptr + cols1, mask=mask1, other=0.0).to(tl.float32)
+    w1 = tl.load(W + cols1, mask=mask1, other=0.0).to(tl.float32)
+    dy_w1 = dy1 * w1
 
-    for off in range(0, N, BLOCK_SIZE):
-        cols = off + tl.arange(0, BLOCK_SIZE)
-        mask = cols < N
-        dy = tl.load(dy_row_ptr + cols, mask=mask, other=0.0).to(tl.float32)
-        sum_res = tl.load(res_out_row_ptr + cols, mask=mask, other=0.0).to(tl.float32)
-        w = tl.load(W + cols, mask=mask, other=0.0).to(tl.float32)
-        dy_w = dy * w
-        d_sum = rsqrt * (dy_w - sum_res * (rsqrt * rsqrt * c1))
-        if HAS_DRES:
-            dres = tl.load(
-                dResOut + row_idx * stride_dres_out_row + cols,
-                mask=mask,
-                other=0.0,
-            ).to(tl.float32)
-            d_sum = d_sum + dres
-        tl.store(dsum_row_ptr + cols, d_sum.to(dSumRes.dtype.element_ty), mask=mask)
+    c1 = (tl.sum(dy_w0 * sum0, axis=0) + tl.sum(dy_w1 * sum1, axis=0)) / N
+    scale = rsqrt * rsqrt * c1
+
+    d_sum0 = rsqrt * (dy_w0 - sum0 * scale)
+    d_sum1 = rsqrt * (dy_w1 - sum1 * scale)
+
+    if HAS_DRES:
+        dres_row_ptr = dResOut + row_idx * stride_dres_out_row
+        dres0 = tl.load(dres_row_ptr + cols0, mask=mask0, other=0.0).to(tl.float32)
+        dres1 = tl.load(dres_row_ptr + cols1, mask=mask1, other=0.0).to(tl.float32)
+        d_sum0 = d_sum0 + dres0
+        d_sum1 = d_sum1 + dres1
+
+    tl.store(dsum_row_ptr + cols0, d_sum0.to(dSumRes.dtype.element_ty), mask=mask0)
+    tl.store(dsum_row_ptr + cols1, d_sum1.to(dSumRes.dtype.element_ty), mask=mask1)
 
 
 def _as_contiguous_2d(t: torch.Tensor, last_dim: int) -> torch.Tensor:

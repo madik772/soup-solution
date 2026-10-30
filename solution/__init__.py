@@ -10,6 +10,12 @@ from solution.cross_entropy import (
 )
 from solution.swiglu import TritonSwiGLUFunction
 from solution.rope import TritonRoPEFunction
+from solution.unpad import (
+    unpad_input,
+    pad_input,
+    set_active_attention_mask,
+    get_active_attention_mask,
+)
 
 _orig_F_cross_entropy = getattr(F, "_orig_cross_entropy", F.cross_entropy)
 F._orig_cross_entropy = _orig_F_cross_entropy
@@ -100,7 +106,7 @@ def custom_model_loss_function(
         labels = F.pad(labels, (0, 1), value=ignore_index)
         shift_labels = labels[..., 1:].contiguous()
 
-    # Keep logits in native dtype (fp16/bf16); Triton kernel computes reduction in fp32
+    # Keep logits in native dtype; Triton kernel computes reduction in fp32
     logits_2d = (
         logits.view(-1, vocab_size)
         if vocab_size is not None
@@ -173,7 +179,7 @@ def apply(model=None):
 
         modeling_qwen2.Qwen2RMSNorm.forward = custom_rmsnorm_forward
 
-        # 2. SwiGLU MLP
+        # 2. SwiGLU MLP + Sequence Unpadding + native compute_dtype (fp16) execution
         _orig_mlp_forward = getattr(
             modeling_qwen2.Qwen2MLP,
             "_orig_forward",
@@ -181,13 +187,64 @@ def apply(model=None):
         )
         modeling_qwen2.Qwen2MLP._orig_forward = _orig_mlp_forward
 
-        def custom_mlp_forward(self, x):
+        def custom_mlp_forward(self, x, attention_mask=None):
             act = getattr(getattr(self, "config", None), "hidden_act", "silu")
             if act != "silu" or not x.is_cuda:
                 return _orig_mlp_forward(self, x)
-            return self.down_proj(TritonSwiGLUFunction.apply(self.gate_proj(x), self.up_proj(x)))
+
+            orig_dtype = x.dtype
+            compute_dtype = getattr(self.gate_proj, "compute_dtype", None)
+            if compute_dtype is None:
+                qs = getattr(getattr(self.gate_proj, "weight", None), "quant_state", None)
+                compute_dtype = getattr(qs, "dtype", None)
+
+            mask = attention_mask if attention_mask is not None else get_active_attention_mask()
+            if mask is not None and x.ndim == 3 and mask.numel() == x.shape[0] * x.shape[1]:
+                unpadded_x, indices, orig_shape = unpad_input(x, mask)
+                if compute_dtype is not None and unpadded_x.dtype != compute_dtype:
+                    unpadded_x = unpadded_x.to(compute_dtype)
+                out = self.down_proj(
+                    TritonSwiGLUFunction.apply(
+                        self.gate_proj(unpadded_x),
+                        self.up_proj(unpadded_x),
+                    )
+                )
+                if out.dtype != orig_dtype:
+                    out = out.to(orig_dtype)
+                return pad_input(out, indices, orig_shape)
+
+            x_mlp = (
+                x.to(compute_dtype)
+                if (compute_dtype is not None and orig_dtype != compute_dtype)
+                else x
+            )
+            out = self.down_proj(
+                TritonSwiGLUFunction.apply(self.gate_proj(x_mlp), self.up_proj(x_mlp))
+            )
+            return out.to(orig_dtype) if out.dtype != orig_dtype else out
 
         modeling_qwen2.Qwen2MLP.forward = custom_mlp_forward
+
+        # 2b. Capture 2D attention_mask in Qwen2Model.forward for Sequence Unpadding
+        if hasattr(modeling_qwen2, "Qwen2Model"):
+            _orig_qwen2_model_forward = getattr(
+                modeling_qwen2.Qwen2Model,
+                "_orig_forward",
+                modeling_qwen2.Qwen2Model.forward,
+            )
+            modeling_qwen2.Qwen2Model._orig_forward = _orig_qwen2_model_forward
+
+            def custom_qwen2_model_forward(self, *args, **kwargs):
+                attn_mask = kwargs.get("attention_mask", None)
+                if attn_mask is None and len(args) >= 2:
+                    attn_mask = args[1]
+                set_active_attention_mask(attn_mask)
+                try:
+                    return _orig_qwen2_model_forward(self, *args, **kwargs)
+                finally:
+                    set_active_attention_mask(None)
+
+            modeling_qwen2.Qwen2Model.forward = custom_qwen2_model_forward
 
         # 3. Fused RoPE
         _orig_apply_rotary_pos_emb = getattr(
@@ -267,7 +324,7 @@ def apply(model=None):
 
             modeling_qwen2.Qwen2DecoderLayer.forward = custom_decoder_layer_forward
 
-        # 5. Patch Qwen2ForCausalLM.loss_function and transformers.loss.loss_utils to avoid fp32 logits upcast
+        # 5. Patch Qwen2ForCausalLM.loss_function and transformers.loss.loss_utils
         if hasattr(modeling_qwen2, "Qwen2ForCausalLM"):
             try:
                 modeling_qwen2.Qwen2ForCausalLM.loss_function = staticmethod(

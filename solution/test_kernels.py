@@ -217,6 +217,34 @@ def test_chunked_cross_entropy_matches_pytorch(dtype):
     torch.testing.assert_close(h.grad.float(), ref_dh, rtol=tol, atol=tol)
 
 
+@needs_cuda
+@pytest.mark.parametrize("dtype", [torch.float16, torch.float32])
+def test_unpad_pad_matches_pytorch(dtype):
+    from solution.unpad import unpad_input, pad_input
+
+    torch.manual_seed(0)
+    B, S, D = 4, 64, 1536
+    x = torch.randn((B, S, D), device="cuda", dtype=dtype, requires_grad=True)
+    dy = torch.randn((B, S, D), device="cuda", dtype=dtype)
+    mask = torch.ones((B, S), device="cuda", dtype=torch.long)
+    mask[0, 20:] = 0
+    mask[1, 45:] = 0
+    mask[2, 10:] = 0
+
+    ref_x = x.detach().clone().requires_grad_(True)
+    ref_out = (ref_x * 2.0) * mask.unsqueeze(-1).to(dtype)
+    ref_out.backward(dy)
+    ref_dx = ref_x.grad.clone()
+
+    unpadded, indices, orig_shape = unpad_input(x, mask)
+    out = pad_input(unpadded * 2.0, indices, orig_shape)
+    out.backward(dy)
+
+    tol = TOLERANCE[dtype]
+    torch.testing.assert_close(out, ref_out, rtol=tol, atol=tol)
+    torch.testing.assert_close(x.grad, ref_dx, rtol=tol, atol=tol)
+
+
 def test_apply_patches_cross_entropy_and_model():
     import solution
 

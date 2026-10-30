@@ -32,6 +32,7 @@ EXPECTED_KERNELS = {
     },
     "cross_entropy.py": {"_custom_ce_fwd_kernel", "_custom_ce_bwd_kernel"},
     "rope.py": {"_custom_fused_rope_fwd_kernel", "_custom_fused_rope_bwd_kernel"},
+    "unpad.py": {"unpad_input", "pad_input"},
 }
 
 
@@ -95,7 +96,7 @@ def api_request(
 
 
 def verify_solution_kernels() -> None:
-    print("[1/6] Verifying custom Triton kernels in solution/...")
+    print("[1/6] Verifying custom Triton kernels and modules in solution/...")
     solution_dir = REPO_ROOT / "solution"
     for filename, expected_names in EXPECTED_KERNELS.items():
         path = solution_dir / filename
@@ -107,7 +108,7 @@ def verify_solution_kernels() -> None:
         }
         missing = expected_names - defined_funcs
         if missing:
-            raise RuntimeError(f"Missing kernels {sorted(missing)} in {path}")
+            raise RuntimeError(f"Missing functions {sorted(missing)} in {path}")
         print(f"  OK {filename}: {', '.join(sorted(expected_names))}")
 
 
@@ -156,7 +157,7 @@ def sync_git_repo() -> None:
     if changes:
         print("Detected changes:\n" + changes)
         subprocess.run(["git", "add", "."], cwd=REPO_ROOT, check=True)
-        commit_msg = f"Stage 3: Fused Add+RMSNorm and Chunked Cross-Entropy ({time.strftime('%Y-%m-%d %H:%M:%S')})"
+        commit_msg = f"Stage 4: Sequence Unpadding + FP16 MLP & Register RMSNorm ({time.strftime('%Y-%m-%d %H:%M:%S')})"
         subprocess.run(["git", "commit", "-m", commit_msg], cwd=REPO_ROOT, check=False)
 
     print("Pushing to origin main...")
