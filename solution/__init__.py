@@ -2,7 +2,11 @@ import inspect
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from solution.rmsnorm import TritonRMSNormFunction, TritonFusedAddRMSNormFunction
+from solution.rmsnorm import (
+    TritonRMSNormFunction,
+    TritonFusedAddRMSNormFunction,
+    fused_add_rmsnorm,
+)
 from solution.cross_entropy import (
     TritonCrossEntropyFunction,
     ChunkedCrossEntropyFunction,
@@ -16,6 +20,8 @@ from solution.unpad import (
     set_active_attention_mask,
     get_active_attention_mask,
 )
+
+_DEFERRED_RESIDUAL_ACTIVE = False
 
 _orig_F_cross_entropy = getattr(F, "_orig_cross_entropy", F.cross_entropy)
 F._orig_cross_entropy = _orig_F_cross_entropy
@@ -222,7 +228,7 @@ def apply(model=None):
     try:
         from transformers.models.qwen2 import modeling_qwen2
 
-        # 1. RMSNorm (runs on input_layernorm and model.norm)
+        # 1. RMSNorm (runs on Layer 0 input_layernorm and fuses final residual in model.norm)
         _orig_rmsnorm_forward = getattr(
             modeling_qwen2.Qwen2RMSNorm,
             "_orig_forward",
@@ -233,6 +239,16 @@ def apply(model=None):
         def custom_rmsnorm_forward(self, hidden_states):
             if not hidden_states.is_cuda:
                 return _orig_rmsnorm_forward(self, hidden_states)
+            pending_res = getattr(hidden_states, "_pending_residual", None)
+            if pending_res is not None:
+                y, _ = fused_add_rmsnorm(
+                    pending_res,
+                    hidden_states,
+                    self.weight,
+                    self.variance_epsilon,
+                    pending_res.dtype,
+                )
+                return y
             return TritonRMSNormFunction.apply(
                 hidden_states,
                 self.weight,
@@ -241,7 +257,7 @@ def apply(model=None):
 
         modeling_qwen2.Qwen2RMSNorm.forward = custom_rmsnorm_forward
 
-        # 2. SwiGLU MLP + Sequence Unpadding + native compute_dtype (fp16) execution
+        # 2. Full Sequence Unpadding of Qwen2MLP + Fused SwiGLU in native compute_dtype (fp16)
         _orig_mlp_forward = getattr(
             modeling_qwen2.Qwen2MLP,
             "_orig_forward",
@@ -255,31 +271,26 @@ def apply(model=None):
                 return _orig_mlp_forward(self, x)
 
             compute_dtype = _get_mlp_compute_dtype(self)
+            if compute_dtype is not None and x.dtype != compute_dtype:
+                x = x.to(compute_dtype)
+
             mask = attention_mask if attention_mask is not None else get_active_attention_mask()
             if mask is not None and x.ndim == 3 and mask.numel() == x.shape[0] * x.shape[1]:
-                unpadded_x, indices, orig_shape = unpad_input(x, mask)
-                if compute_dtype is not None and unpadded_x.dtype != compute_dtype:
-                    unpadded_x = unpadded_x.to(compute_dtype)
-                out = self.down_proj(
-                    TritonSwiGLUFunction.apply(
-                        self.gate_proj(unpadded_x),
-                        self.up_proj(unpadded_x),
-                    )
-                )
-                return pad_input(out, indices, orig_shape)
+                unpadded_hidden, indices, orig_shape = unpad_input(x, mask)
+                gate = self.gate_proj(unpadded_hidden)
+                up = self.up_proj(unpadded_hidden)
+                swiglu_out = TritonSwiGLUFunction.apply(gate, up)
+                mlp_out_unpadded = self.down_proj(swiglu_out)
+                return pad_input(mlp_out_unpadded, indices, orig_shape)
 
-            x_mlp = (
-                x.to(compute_dtype)
-                if (compute_dtype is not None and x.dtype != compute_dtype)
-                else x
-            )
-            return self.down_proj(
-                TritonSwiGLUFunction.apply(self.gate_proj(x_mlp), self.up_proj(x_mlp))
-            )
+            gate = self.gate_proj(x)
+            up = self.up_proj(x)
+            swiglu_out = TritonSwiGLUFunction.apply(gate, up)
+            return self.down_proj(swiglu_out)
 
         modeling_qwen2.Qwen2MLP.forward = custom_mlp_forward
 
-        # 2b. Capture 2D attention_mask in Qwen2Model.forward for Sequence Unpadding
+        # 2b. Capture 2D attention_mask and enable cross-layer Dual Fused Add + RMSNorm
         if hasattr(modeling_qwen2, "Qwen2Model"):
             _orig_qwen2_model_forward = getattr(
                 modeling_qwen2.Qwen2Model,
@@ -289,14 +300,18 @@ def apply(model=None):
             modeling_qwen2.Qwen2Model._orig_forward = _orig_qwen2_model_forward
 
             def custom_qwen2_model_forward(self, *args, **kwargs):
+                global _DEFERRED_RESIDUAL_ACTIVE
                 attn_mask = kwargs.get("attention_mask", None)
                 if attn_mask is None and len(args) >= 2:
                     attn_mask = args[1]
                 set_active_attention_mask(attn_mask)
+                prev_deferred = _DEFERRED_RESIDUAL_ACTIVE
+                _DEFERRED_RESIDUAL_ACTIVE = not bool(kwargs.get("output_hidden_states", False))
                 try:
                     return _orig_qwen2_model_forward(self, *args, **kwargs)
                 finally:
                     set_active_attention_mask(None)
+                    _DEFERRED_RESIDUAL_ACTIVE = prev_deferred
 
             modeling_qwen2.Qwen2Model.forward = custom_qwen2_model_forward
 
@@ -327,18 +342,7 @@ def apply(model=None):
             if isinstance(fwd_globals, dict) and "apply_rotary_pos_emb" in fwd_globals:
                 fwd_globals["apply_rotary_pos_emb"] = custom_apply_rotary_pos_emb
 
-        # Restore native SDPA in ALL_ATTENTION_FUNCTIONS if previously patched
-        attn_funcs = getattr(modeling_qwen2, "ALL_ATTENTION_FUNCTIONS", None)
-        if attn_funcs is not None and hasattr(modeling_qwen2, "_orig_sdpa_attn_fwd"):
-            attn_funcs["sdpa"] = modeling_qwen2._orig_sdpa_attn_fwd
-            try:
-                from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS as global_attn_funcs
-
-                global_attn_funcs["sdpa"] = modeling_qwen2._orig_sdpa_attn_fwd
-            except Exception:
-                pass
-
-        # 4. Fused Add + RMSNorm in Qwen2DecoderLayer
+        # 4. Dual Fused Add + RMSNorm in Qwen2DecoderLayer (both Layernorm 1 and Layernorm 2)
         if hasattr(modeling_qwen2, "Qwen2DecoderLayer"):
             _orig_decoder_layer_forward = getattr(
                 modeling_qwen2.Qwen2DecoderLayer,
@@ -360,35 +364,54 @@ def apply(model=None):
                 if not hidden_states.is_cuda or kwargs.get("output_attentions", False):
                     return _orig_decoder_layer_forward(self, hidden_states, *args, **kwargs)
 
-                orig_dtype = hidden_states.dtype
-                residual = hidden_states
                 mlp_dtype = _get_mlp_compute_dtype(self.mlp)
-                hidden_states = TritonRMSNormFunction.apply(
-                    hidden_states,
-                    self.input_layernorm.weight,
-                    self.input_layernorm.variance_epsilon,
-                    mlp_dtype,
-                )
+                pending_res = getattr(hidden_states, "_pending_residual", None)
+
+                # Layernorm 1: Fused Add + RMSNorm for layers 1..27, RMSNorm for layer 0
+                if pending_res is not None:
+                    orig_dtype = pending_res.dtype
+                    hidden_states, residual = fused_add_rmsnorm(
+                        pending_res,
+                        hidden_states,
+                        self.input_layernorm.weight,
+                        self.input_layernorm.variance_epsilon,
+                        mlp_dtype,
+                    )
+                else:
+                    orig_dtype = hidden_states.dtype
+                    residual = hidden_states
+                    hidden_states = TritonRMSNormFunction.apply(
+                        hidden_states,
+                        self.input_layernorm.weight,
+                        self.input_layernorm.variance_epsilon,
+                        mlp_dtype,
+                    )
 
                 attn_outputs = self.self_attn(hidden_states, *args, **kwargs)
                 if isinstance(attn_outputs, tuple):
-                    hidden_states = attn_outputs[0]
+                    attn_states = attn_outputs[0]
                     rest = attn_outputs[1:]
                 else:
-                    hidden_states = attn_outputs
+                    attn_states = attn_outputs
                     rest = ()
 
-                hidden_states, residual = TritonFusedAddRMSNormFunction.apply(
+                # Layernorm 2: Fused Add + RMSNorm before MLP
+                hidden_states, residual = fused_add_rmsnorm(
                     residual,
-                    hidden_states,
+                    attn_states,
                     self.post_attention_layernorm.weight,
                     self.post_attention_layernorm.variance_epsilon,
                     mlp_dtype,
                 )
+
                 hidden_states = self.mlp(hidden_states)
-                hidden_states = residual + hidden_states
-                if hidden_states.dtype != orig_dtype:
-                    hidden_states = hidden_states.to(orig_dtype)
+
+                if _DEFERRED_RESIDUAL_ACTIVE:
+                    hidden_states._pending_residual = residual
+                else:
+                    hidden_states = residual + hidden_states
+                    if hidden_states.dtype != orig_dtype:
+                        hidden_states = hidden_states.to(orig_dtype)
 
                 if _dec_returns_tuple:
                     outputs = (hidden_states,)

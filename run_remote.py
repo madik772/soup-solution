@@ -157,7 +157,7 @@ def sync_git_repo() -> None:
     if changes:
         print("Detected changes:\n" + changes)
         subprocess.run(["git", "add", "."], cwd=REPO_ROOT, check=True)
-        commit_msg = f"Final Optimization: 10 Triton Kernels + Native FP16 SDPA + Unpadding + Chunked CE 4096 ({time.strftime('%Y-%m-%d %H:%M:%S')})"
+        commit_msg = f"Max Speed: Dual Fused Add+RMSNorm + Full MLP Unpadding + T4 Micro-Tuning ({time.strftime('%Y-%m-%d %H:%M:%S')})"
         subprocess.run(["git", "commit", "-m", commit_msg], cwd=REPO_ROOT, check=False)
 
     print("Pushing to origin main...")

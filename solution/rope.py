@@ -24,7 +24,7 @@ def _custom_fused_rope_fwd_kernel(
     s_row_ptr = Sin + i0 * stride_s0 + i1 * stride_s1 + i2 * stride_s2
     o_row_ptr = Out + i0 * stride_o0 + i1 * stride_o1 + i2 * stride_o2
 
-    cols = tl.arange(0, BLOCK_SIZE).to(tl.int64)
+    cols = tl.arange(0, BLOCK_SIZE)
     mask = cols < half_dim
 
     x1 = tl.load(x_row_ptr + cols * stride_x3, mask=mask, other=0.0).to(tl.float32)
@@ -61,7 +61,7 @@ def _custom_fused_rope_bwd_kernel(
     s_row_ptr = Sin + i0 * stride_s0 + i1 * stride_s1 + i2 * stride_s2
     dx_row_ptr = dX + i0 * stride_dx0 + i1 * stride_dx1 + i2 * stride_dx2
 
-    cols = tl.arange(0, BLOCK_SIZE).to(tl.int64)
+    cols = tl.arange(0, BLOCK_SIZE)
     mask = cols < half_dim
 
     dout1 = tl.load(do_row_ptr + cols * stride_do3, mask=mask, other=0.0).to(tl.float32)
@@ -158,7 +158,9 @@ class TritonRoPEFunction(torch.autograd.Function):
         n_rows = D0 * D1 * D2
 
         dout_4d = dout if dout.ndim == 4 else dout.reshape(D0, D1, D2, head_dim)
-        dx_4d = torch.empty(ctx.x_4d_shape, device=dout.device, dtype=dout.dtype)
+        base_do = dout._base if dout._base is not None else dout
+        inplace_bwd = (not base_do.is_leaf) and dout_4d.stride(-1) == 1
+        dx_4d = dout_4d if inplace_bwd else torch.empty(ctx.x_4d_shape, device=dout.device, dtype=dout.dtype)
 
         _custom_fused_rope_bwd_kernel[(n_rows,)](
             dout_4d, cos_4d, sin_4d, dx_4d,
@@ -172,7 +174,7 @@ class TritonRoPEFunction(torch.autograd.Function):
             num_stages=2,
         )
 
-        return (dx_4d if len(ctx.orig_shape) == 4 else dx_4d.reshape(*orig_shape)), None, None
+        return (dx_4d if len(ctx.orig_shape) == 4 else dx_4d.reshape(*ctx.orig_shape)), None, None
 
 
 def rope(x, cos, sin):

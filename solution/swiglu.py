@@ -2,7 +2,7 @@ import torch
 import triton
 import triton.language as tl
 
-BLOCK_SIZE = 2048
+BLOCK_SIZE = 1024
 
 
 @triton.jit
