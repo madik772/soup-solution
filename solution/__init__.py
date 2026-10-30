@@ -106,7 +106,6 @@ def custom_model_loss_function(
         labels = F.pad(labels, (0, 1), value=ignore_index)
         shift_labels = labels[..., 1:].contiguous()
 
-    # Keep logits in native dtype; Triton kernel computes reduction in fp32
     logits_2d = (
         logits.view(-1, vocab_size)
         if vocab_size is not None
@@ -156,6 +155,14 @@ def _patch_model_loss_attributes(model):
                 queue.append(child)
 
 
+def _get_mlp_compute_dtype(mlp):
+    cd = getattr(mlp.gate_proj, "compute_dtype", None)
+    if cd is None:
+        qs = getattr(getattr(mlp.gate_proj, "weight", None), "quant_state", None)
+        cd = getattr(qs, "dtype", None)
+    return cd
+
+
 def apply(model=None):
     try:
         from transformers.models.qwen2 import modeling_qwen2
@@ -192,12 +199,7 @@ def apply(model=None):
             if act != "silu" or not x.is_cuda:
                 return _orig_mlp_forward(self, x)
 
-            orig_dtype = x.dtype
-            compute_dtype = getattr(self.gate_proj, "compute_dtype", None)
-            if compute_dtype is None:
-                qs = getattr(getattr(self.gate_proj, "weight", None), "quant_state", None)
-                compute_dtype = getattr(qs, "dtype", None)
-
+            compute_dtype = _get_mlp_compute_dtype(self)
             mask = attention_mask if attention_mask is not None else get_active_attention_mask()
             if mask is not None and x.ndim == 3 and mask.numel() == x.shape[0] * x.shape[1]:
                 unpadded_x, indices, orig_shape = unpad_input(x, mask)
@@ -209,19 +211,16 @@ def apply(model=None):
                         self.up_proj(unpadded_x),
                     )
                 )
-                if out.dtype != orig_dtype:
-                    out = out.to(orig_dtype)
                 return pad_input(out, indices, orig_shape)
 
             x_mlp = (
                 x.to(compute_dtype)
-                if (compute_dtype is not None and orig_dtype != compute_dtype)
+                if (compute_dtype is not None and x.dtype != compute_dtype)
                 else x
             )
-            out = self.down_proj(
+            return self.down_proj(
                 TritonSwiGLUFunction.apply(self.gate_proj(x_mlp), self.up_proj(x_mlp))
             )
-            return out.to(orig_dtype) if out.dtype != orig_dtype else out
 
         modeling_qwen2.Qwen2MLP.forward = custom_mlp_forward
 
@@ -295,6 +294,7 @@ def apply(model=None):
                 if not hidden_states.is_cuda or kwargs.get("output_attentions", False):
                     return _orig_decoder_layer_forward(self, hidden_states, *args, **kwargs)
 
+                orig_dtype = hidden_states.dtype
                 residual = hidden_states
                 hidden_states = self.input_layernorm(hidden_states)
 
@@ -306,14 +306,20 @@ def apply(model=None):
                     hidden_states = attn_outputs
                     rest = ()
 
+                mlp_dtype = _get_mlp_compute_dtype(self.mlp)
                 hidden_states, residual = TritonFusedAddRMSNormFunction.apply(
                     residual,
                     hidden_states,
                     self.post_attention_layernorm.weight,
                     self.post_attention_layernorm.variance_epsilon,
+                    mlp_dtype,
                 )
                 hidden_states = self.mlp(hidden_states)
+                if hidden_states.dtype != residual.dtype:
+                    hidden_states = hidden_states.to(residual.dtype)
                 hidden_states = residual + hidden_states
+                if hidden_states.dtype != orig_dtype:
+                    hidden_states = hidden_states.to(orig_dtype)
 
                 if _dec_returns_tuple:
                     outputs = (hidden_states,)

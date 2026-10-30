@@ -2,7 +2,7 @@ import torch
 import triton
 import triton.language as tl
 
-BLOCK_SIZE = 1024
+BLOCK_SIZE = 2048
 
 
 @triton.jit
@@ -20,7 +20,7 @@ def _custom_fused_swiglu_fwd_kernel(
     o_row_ptr = Out + row_idx * stride_o_row
 
     for col_off in range(0, n_cols, BLOCK_SIZE):
-        cols = (col_off + tl.arange(0, BLOCK_SIZE)).to(tl.int64)
+        cols = col_off + tl.arange(0, BLOCK_SIZE)
         mask = cols < n_cols
 
         g_ptrs = g_row_ptr + cols * stride_g_col
@@ -58,7 +58,7 @@ def _custom_fused_swiglu_bwd_kernel(
     du_row_ptr = dUp + row_idx * stride_du_row
 
     for col_off in range(0, n_cols, BLOCK_SIZE):
-        cols = (col_off + tl.arange(0, BLOCK_SIZE)).to(tl.int64)
+        cols = col_off + tl.arange(0, BLOCK_SIZE)
         mask = cols < n_cols
 
         do_ptrs = do_row_ptr + cols * stride_do_col
@@ -109,11 +109,14 @@ class TritonSwiGLUFunction(torch.autograd.Function):
             out_2d.stride(0), out_2d.stride(1),
             N,
             BLOCK_SIZE=BLOCK_SIZE,
-            num_warps=4,
+            num_warps=8,
             num_stages=2,
         )
+        base_g = gate._base if gate._base is not None else gate
+        base_u = up._base if up._base is not None else up
         ctx.save_for_backward(gate_2d, up_2d)
         ctx.orig_shape = orig_shape
+        ctx.inplace_bwd = (not base_g.is_leaf) and (not base_u.is_leaf) and (up.dtype == gate.dtype)
         return out_2d.view(*orig_shape)
 
     @staticmethod
@@ -127,8 +130,12 @@ class TritonSwiGLUFunction(torch.autograd.Function):
             grad_cast = grad_cast.contiguous()
         grad_2d = grad_cast if grad_cast.ndim == 2 else grad_cast.view(M, N)
 
-        d_gate = torch.empty_like(gate_2d)
-        d_up = torch.empty_like(up_2d)
+        if ctx.inplace_bwd:
+            d_gate = gate_2d
+            d_up = up_2d
+        else:
+            d_gate = torch.empty_like(gate_2d)
+            d_up = torch.empty_like(up_2d)
 
         _custom_fused_swiglu_bwd_kernel[(M,)](
             grad_2d, gate_2d, up_2d, d_gate, d_up,
@@ -139,7 +146,7 @@ class TritonSwiGLUFunction(torch.autograd.Function):
             d_up.stride(0), d_up.stride(1),
             N,
             BLOCK_SIZE=BLOCK_SIZE,
-            num_warps=4,
+            num_warps=8,
             num_stages=2,
         )
         return d_gate.view(*orig_shape), d_up.view(*orig_shape)

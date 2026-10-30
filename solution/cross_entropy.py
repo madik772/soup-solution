@@ -2,7 +2,7 @@ import torch
 import triton
 import triton.language as tl
 
-DEFAULT_CHUNK_SIZE = 4096
+DEFAULT_CHUNK_SIZE = 2048
 BLOCK_SIZE = 4096
 
 
@@ -98,7 +98,6 @@ def _ce_forward_nograd(logits_2d, targets_1d, ignore_index=-100, reduction="mean
         targets_1d = targets_1d.contiguous()
 
     Loss = torch.empty(N, device=logits_2d.device, dtype=torch.float32)
-    # Pass Loss as both Loss and LSE since LSE is written before Loss per row
     _custom_ce_fwd_kernel[(N,)](
         logits_2d,
         targets_1d,
@@ -170,7 +169,6 @@ class TritonCrossEntropyFunction(torch.autograd.Function):
         logits_2d, targets_1d, LSE, n_valid = ctx.saved_tensors
         N, V = logits_2d.shape
 
-        # Write dX in-place into logits_2d when it is a non-leaf activation (saves 622+ MB VRAM)
         dX = logits_2d if ctx.inplace_bwd else torch.empty_like(logits_2d)
 
         _custom_ce_bwd_kernel[(N,)](
@@ -195,7 +193,7 @@ class TritonCrossEntropyFunction(torch.autograd.Function):
 
 
 class ChunkedCrossEntropyFunction(torch.autograd.Function):
-    """Chunked Cross-Entropy over hidden_states and lm_head.weight with in-place backward."""
+    """Chunked Cross-Entropy over hidden_states and lm_head.weight with CHUNK_SIZE=2048."""
 
     @staticmethod
     def forward(

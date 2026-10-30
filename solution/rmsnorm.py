@@ -209,17 +209,20 @@ class TritonRMSNormFunction(torch.autograd.Function):
 
 class TritonFusedAddRMSNormFunction(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, residual, x, weight, eps=1e-6):
+    def forward(ctx, residual, x, weight, eps=1e-6, out_dtype=None):
         ctx.set_materialize_grads(False)
         orig_shape = x.shape
         N = orig_shape[-1]
         res_2d = _as_contiguous_2d(residual, N)
-        x_cast = x if x.dtype == res_2d.dtype else x.to(res_2d.dtype)
-        x_2d = _as_contiguous_2d(x_cast, N)
+        x_2d = _as_contiguous_2d(x, N)
         M = x_2d.shape[0]
 
-        res_out_2d = torch.empty_like(res_2d)
-        y_2d = torch.empty_like(x_2d)
+        base_x = x._base if x._base is not None else x
+        inplace_res = (not base_x.is_leaf) and (x_2d.dtype == res_2d.dtype)
+        res_out_2d = x_2d if inplace_res else torch.empty_like(res_2d)
+
+        y_dtype = out_dtype if out_dtype is not None else res_2d.dtype
+        y_2d = torch.empty((M, N), device=x.device, dtype=y_dtype)
         rsqrt = torch.empty(M, device=x.device, dtype=torch.float32)
 
         _custom_fused_add_rmsnorm_fwd_kernel[(M,)](
@@ -233,6 +236,8 @@ class TritonFusedAddRMSNormFunction(torch.autograd.Function):
         ctx.save_for_backward(res_out_2d, weight, rsqrt)
         ctx.orig_shape = orig_shape
         ctx.N = N
+        ctx.inplace_res = inplace_res and (weight is None or not weight.requires_grad)
+        ctx.x_dtype = x.dtype
         return y_2d.view(*orig_shape), res_out_2d.view(*orig_shape)
 
     @staticmethod
@@ -244,19 +249,17 @@ class TritonFusedAddRMSNormFunction(torch.autograd.Function):
         if dy is None:
             dy_2d = torch.zeros_like(res_out_2d)
         else:
-            dy_cast = dy if dy.dtype == res_out_2d.dtype else dy.to(res_out_2d.dtype)
-            dy_2d = _as_contiguous_2d(dy_cast, N)
+            dy_2d = _as_contiguous_2d(dy, N)
 
         has_dres = d_res_out is not None
         if has_dres:
-            dres_cast = d_res_out if d_res_out.dtype == res_out_2d.dtype else d_res_out.to(res_out_2d.dtype)
-            dres_2d = _as_contiguous_2d(dres_cast, N)
+            dres_2d = _as_contiguous_2d(d_res_out, N)
             dres_stride = dres_2d.stride(0)
         else:
             dres_2d = res_out_2d
             dres_stride = 0
 
-        d_sum_2d = torch.empty_like(res_out_2d)
+        d_sum_2d = res_out_2d if ctx.inplace_res else torch.empty_like(res_out_2d)
 
         _custom_fused_add_rmsnorm_bwd_kernel[(M,)](
             dy_2d, dres_2d, res_out_2d, weight, rsqrt, d_sum_2d,
@@ -269,12 +272,13 @@ class TritonFusedAddRMSNormFunction(torch.autograd.Function):
         )
 
         d_sum = d_sum_2d.view(*orig_shape)
+        dx = d_sum if d_sum.dtype == ctx.x_dtype else d_sum.to(ctx.x_dtype)
         if weight is None or not weight.requires_grad:
-            return d_sum, d_sum, None, None
+            return d_sum, dx, None, None, None
 
         dw = (dy_2d.float() * (res_out_2d.float() * rsqrt.unsqueeze(1))).sum(dim=0).to(weight.dtype)
-        return d_sum, d_sum, dw, None
+        return d_sum, dx, dw, None, None
 
 
-def fused_add_rmsnorm(residual, x, weight, eps=1e-6):
-    return TritonFusedAddRMSNormFunction.apply(residual, x, weight, eps)
+def fused_add_rmsnorm(residual, x, weight, eps=1e-6, out_dtype=None):
+    return TritonFusedAddRMSNormFunction.apply(residual, x, weight, eps, out_dtype)
