@@ -1,9 +1,12 @@
 # Submission: TODO team name
 
 ## Links
-- Repository, final commit: https://github.com/madik772/soup-solution/commit/TODO-final-sha
-- Public Kaggle notebook, the saved version (`COMMIT` in it = the sha above; the same link is in
-  the README): https://www.kaggle.com/code/madiyarzhumazhan/notebook0b34895d24?scriptVersionId=TODO
+- Repository: https://github.com/madik772/soup-solution — final solution code at commit
+  https://github.com/madik772/soup-solution/commit/c64181f (later commits change documentation
+  and our Kaggle helper only; `solution/` is unchanged)
+- Public Kaggle notebook (the same link is in the README):
+  https://www.kaggle.com/code/madiyarzhumazhan/notebook0b34895d24 — saved version with `COMMIT`
+  pinned: TODO paste the version link after Save & Run All
 - Demo video (up to 3 minutes): TODO
 - Presentation: TODO
 
@@ -14,7 +17,7 @@
 
 ## Our kernels
 Shares from `own_kernel_ms` / `timed_loop_s` of the solution run (steps 3+, Kaggle T4, commit
-ace36c7).
+c64181f).
 
 | Kernel (`@triton.jit` name) | File | What it replaces | Share of the training time (check 4) |
 |---|---|---|---|

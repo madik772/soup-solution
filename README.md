@@ -7,8 +7,8 @@ tokens only, keeps little for the backward pass, and never builds the `[batch, s
 logits. Most of the work that is not a cuBLAS GEMM or attention runs in our own `@triton.jit`
 kernels in `solution/`.
 
-**Public Kaggle notebook:** TODO — https://www.kaggle.com/code/madiyarzhumazhan/notebook0b34895d24
-(make it public, set `COMMIT`, Save & Run All, paste the version link here and in `SUBMISSION.md`).
+**Public Kaggle notebook:** https://www.kaggle.com/code/madiyarzhumazhan/notebook0b34895d24
+(the saved version with `COMMIT` pinned is linked in `SUBMISSION.md`).
 
 ## Results (Kaggle T4, `harness/run_task.py`, base and solution in the same session)
 
@@ -22,7 +22,7 @@ kernels in `solution/`.
 | Loss curve vs base | | first step 0.00 %, mean 0.05 % | |
 | Our kernels' share of training time (check 4) | | 17.0 % | |
 
-Commit ace36c7. All 10 checks of `harness/check_rules.py` pass, including the 79 Soup regression
+Commit c64181f. All 10 checks of `harness/check_rules.py` pass, including the 79 Soup regression
 tests with the patches applied, and the 34 tests of `solution/`. The same code in four other
 sessions: 1.66x, 1.59x, 1.58x, 1.50x — a T4's clock and the machine's disk and CPU vary between
 Kaggle sessions (base 82–90 s, our training loop 26.8–31.6 s), so the ratio moves by ±0.1.
