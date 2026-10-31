@@ -15,7 +15,6 @@ from pathlib import Path
 
 USER_NAME = "madiyarzhumazhan"
 KERNEL_SLUG = "notebook0b34895d24"
-FALLBACK_TOKEN = "KGAT_40d5f57afca671aa52de9e25e336c771"
 REPO_GIT_URL = "https://github.com/madik772/soup-solution.git"
 BASE_URL = "https://www.kaggle.com/api/v1"
 POLL_INTERVAL_SECONDS = 20
@@ -37,19 +36,23 @@ EXPECTED_KERNELS = {
 
 
 def load_kaggle_credentials() -> tuple[str, str]:
+    """Credentials from ~/.kaggle/kaggle.json, else KAGGLE_USERNAME / KAGGLE_KEY. Never stored
+    in this repository."""
     user_profile = os.environ.get("USERPROFILE") or os.path.expanduser("~")
     kaggle_json_path = Path(user_profile) / ".kaggle" / "kaggle.json"
     if kaggle_json_path.is_file():
         try:
             with open(kaggle_json_path, "r", encoding="utf-8") as f:
                 data = json.load(f)
-            username = data.get("username") or USER_NAME
-            key = data.get("key") or data.get("token") or FALLBACK_TOKEN
+            key = data.get("key") or data.get("token")
             if key:
-                return username, key
+                return data.get("username") or USER_NAME, key
         except Exception:
             pass
-    return USER_NAME, FALLBACK_TOKEN
+    key = os.environ.get("KAGGLE_KEY")
+    if key:
+        return os.environ.get("KAGGLE_USERNAME") or USER_NAME, key
+    raise SystemExit("No Kaggle credentials: put kaggle.json in ~/.kaggle or set KAGGLE_KEY")
 
 
 def build_auth_headers(key: str) -> dict[str, str]:
@@ -67,7 +70,7 @@ def api_request(
     method: str = "GET",
     payload: dict | None = None,
     username: str = USER_NAME,
-    key: str = FALLBACK_TOKEN,
+    key: str = "",
 ) -> dict:
     body = None
     if payload is not None:
