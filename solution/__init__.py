@@ -36,56 +36,6 @@ _orig_F_sdpa = getattr(
 F._orig_scaled_dot_product_attention = _orig_F_sdpa
 
 
-def custom_scaled_dot_product_attention(
-    query,
-    key,
-    value,
-    attn_mask=None,
-    dropout_p=0.0,
-    is_causal=False,
-    scale=None,
-    enable_gqa=False,
-):
-    if (
-        isinstance(query, torch.Tensor)
-        and query.is_cuda
-        and query.ndim == 4
-        and query.shape[2] == key.shape[2]
-        and query.shape[2] > 1
-        and dropout_p == 0.0
-    ):
-        attn_mask = None
-        is_causal = True
-    elif (
-        attn_mask is not None
-        and isinstance(attn_mask, torch.Tensor)
-        and attn_mask.is_floating_point()
-        and attn_mask.dtype != query.dtype
-    ):
-        attn_mask = attn_mask.to(query.dtype)
-
-    if enable_gqa:
-        return _orig_F_sdpa(
-            query,
-            key,
-            value,
-            attn_mask=attn_mask,
-            dropout_p=dropout_p,
-            is_causal=is_causal,
-            scale=scale,
-            enable_gqa=enable_gqa,
-        )
-    return _orig_F_sdpa(
-        query,
-        key,
-        value,
-        attn_mask=attn_mask,
-        dropout_p=dropout_p,
-        is_causal=is_causal,
-        scale=scale,
-    )
-
-
 def custom_cross_entropy(
     input,
     target,
@@ -481,9 +431,7 @@ def apply(model=None):
     except Exception:
         pass
 
-    # 6. Native F.scaled_dot_product_attention (fp16 causal fast-path) & Custom Cross-Entropy
-    torch.nn.functional.scaled_dot_product_attention = custom_scaled_dot_product_attention
-    F.scaled_dot_product_attention = custom_scaled_dot_product_attention
+    # 6. Custom Cross-Entropy (the standard path; SDPA is left to transformers' own masks)
     torch.nn.functional.cross_entropy = custom_cross_entropy
     F.cross_entropy = custom_cross_entropy
     nn.CrossEntropyLoss.forward = custom_ce_forward

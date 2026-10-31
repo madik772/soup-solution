@@ -186,7 +186,7 @@ def test_packed_step_dropout_masks_are_consistent():
     with torch.no_grad():
         for p, g in zip(lora, grads):
             p.add_(g, alpha=eps.item())
-        plan.consumed = False
+        plan.consumed, plan.lora16 = False, {}  # re-run the step with the moved weights
         loss2 = fast_qwen2.causal_lm_forward(lm, plan)
         for p, g in zip(lora, grads):
             p.sub_(g, alpha=eps.item())
