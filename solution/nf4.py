@@ -27,6 +27,7 @@ def _custom_nf4_dequant_kernel(
     QBLOCK2: tl.constexpr,
     NESTED: tl.constexpr,
     BLOCK_BYTES: tl.constexpr,
+    BLOCK_OUT: tl.constexpr,
 ):
     pid = tl.program_id(0).to(tl.int64)
     byte_idx = pid * BLOCK_BYTES + tl.arange(0, BLOCK_BYTES)
@@ -46,7 +47,7 @@ def _custom_nf4_dequant_kernel(
         scale = tl.load(AbsQ + block, mask=in_range, other=0.0).to(tl.float32)
 
     vals = tl.interleave(first * scale, second * scale)
-    out_idx = pid * (2 * BLOCK_BYTES) + tl.arange(0, 2 * BLOCK_BYTES)
+    out_idx = pid * BLOCK_OUT + tl.arange(0, BLOCK_OUT)
     tl.store(Out + out_idx, vals.to(Out.dtype.element_ty), mask=out_idx < 2 * n_bytes)
 
 
@@ -101,6 +102,7 @@ class NF4Weight:
             QBLOCK2=self.block2,
             NESTED=self.nested,
             BLOCK_BYTES=BLOCK_BYTES,
+            BLOCK_OUT=2 * BLOCK_BYTES,
             num_warps=4,
             num_stages=2,
         )

@@ -197,10 +197,10 @@ def _custom_qkv_rope_pad_fwd_kernel(
     N_HEADS: tl.constexpr,
     N_KV: tl.constexpr,
     HEAD_DIM: tl.constexpr,
+    HALF: tl.constexpr,
+    GROUP: tl.constexpr,
     BLOCK_H: tl.constexpr,
 ):
-    HALF = HEAD_DIM // 2
-    GROUP = N_HEADS // N_KV
     row = tl.program_id(0).to(tl.int64)
     src = tl.load(Map + row).to(tl.int64)
     valid = src >= 0
@@ -248,11 +248,11 @@ def _custom_qkv_rope_pad_bwd_kernel(
     N_HEADS: tl.constexpr,
     N_KV: tl.constexpr,
     HEAD_DIM: tl.constexpr,
+    HALF: tl.constexpr,
+    GROUP: tl.constexpr,
     BLOCK_H: tl.constexpr,
     BLOCK_G: tl.constexpr,
 ):
-    HALF = HEAD_DIM // 2
-    GROUP = N_HEADS // N_KV
     row = tl.program_id(0).to(tl.int64)
     flat = tl.load(Idx + row).to(tl.int64)
     b = flat // seq_len
@@ -308,6 +308,7 @@ def qkv_rope_pad(qkv, row_map, cos, sin, batch, seq_len, n_heads, n_kv, head_dim
         qkv, row_map, cos, sin, qp, kp, vp,
         qkv.stride(0), cos.stride(0), seq_len,
         N_HEADS=n_heads, N_KV=n_kv, HEAD_DIM=head_dim,
+        HALF=head_dim // 2, GROUP=n_heads // n_kv,
         BLOCK_H=triton.next_power_of_2(n_heads),
         num_warps=4, num_stages=2,
     )
@@ -331,6 +332,7 @@ def qkv_rope_pad_backward(dq, dk, dv, real_idx, cos, sin, seq_len, n_heads, n_kv
         dv.stride(0), dv.stride(1), dv.stride(2),
         out.stride(0), cos.stride(0), seq_len,
         N_HEADS=n_heads, N_KV=n_kv, HEAD_DIM=head_dim,
+        HALF=head_dim // 2, GROUP=n_heads // n_kv,
         BLOCK_H=triton.next_power_of_2(n_heads),
         BLOCK_G=triton.next_power_of_2(n_heads // n_kv),
         num_warps=4, num_stages=2,

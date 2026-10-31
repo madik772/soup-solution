@@ -197,6 +197,12 @@ DIAGNOSTICS_SOURCE = (
     "!cd /kaggle/working/repo && for f in runs/*/train.log; do echo \"===== $f\"; "
     "grep -n -i -E 'error|traceback|warn|fast path|exception' $f | tail -n 25; "
     "tail -n 40 $f; done\n"
+    "import json, glob\n"
+    "for path in sorted(glob.glob('/kaggle/working/repo/runs/*/metrics.json')):\n"
+    "    m = json.load(open(path))\n"
+    "    keep = ('apply_s', 'train_loop_s', 'median_step_s', 'timed_loop_s', "
+    "'torch_max_allocated_mib', 'torch_max_reserved_mib', 'own_kernel_ms')\n"
+    "    print('=====', path, {k: m.get(k) for k in keep}, 'steps', m.get('step_s', [])[:8])\n"
 )
 
 
@@ -209,8 +215,8 @@ def add_diagnostics_cell(blob: dict) -> dict:
     cells = nb.get("cells")
     if not isinstance(cells, list):
         return blob
-    if any(DIAGNOSTICS_MARKER in "".join(c.get("source", "")) for c in cells if isinstance(c, dict)):
-        return blob
+    cells[:] = [c for c in cells
+                if not (isinstance(c, dict) and DIAGNOSTICS_MARKER in "".join(c.get("source", "")))]
     cells.append({"cell_type": "code", "execution_count": None, "metadata": {}, "outputs": [],
                   "source": DIAGNOSTICS_SOURCE.splitlines(keepends=True)})
     return dict(blob, text=json.dumps(nb, ensure_ascii=False))

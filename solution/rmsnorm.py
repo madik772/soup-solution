@@ -202,7 +202,7 @@ class TritonFusedAddRMSNormFunction(torch.autograd.Function):
         ctx.orig_shape = orig_shape
         ctx.N = N
         ctx.blk = blk
-        ctx.inplace_bwd = weight is None or not weight.requires_grad
+        ctx.inplace_bwd = False  # res_out is returned to the caller: never overwrite it
         ctx.x_dtype = x.dtype
         return y_2d.view(*orig_shape), res_out_2d.view(*orig_shape)
 

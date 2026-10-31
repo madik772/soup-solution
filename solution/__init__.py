@@ -226,6 +226,9 @@ def _get_mlp_compute_dtype(mlp):
 
 
 def _install_fast_path():
+    from solution import warmup
+
+    warmup.start()
     try:
         from transformers.models.qwen2 import modeling_qwen2
 

@@ -97,6 +97,10 @@ def _tiny_qlora_qwen2(dropout):
         p.requires_grad_(False)
         if p.dtype == torch.float16:  # as peft.prepare_model_for_kbit_training does
             p.data = p.data.float()
+    try:
+        model.is_loaded_in_4bit = True  # what from_pretrained(quantization_config=...) sets
+    except Exception:  # noqa: BLE001
+        pass
     lcfg = peft.LoraConfig(r=8, lora_alpha=16, lora_dropout=dropout, target_modules=["q_proj", "v_proj"],
                            task_type="CAUSAL_LM")
     pm = peft.get_peft_model(model, lcfg)

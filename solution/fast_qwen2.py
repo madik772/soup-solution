@@ -43,6 +43,7 @@ from solution.rmsnorm import (
 from solution.rope import qkv_rope_pad, qkv_rope_pad_backward
 from solution.swiglu import swiglu_packed_bwd_, swiglu_packed_fwd
 from solution.unpad import inverse_map, row_gather
+from solution import warmup
 
 F16 = torch.float16
 STEP_ATTR = "_soup_chunked_step"  # where Soup's rewind recorder looks for per-token losses
@@ -214,6 +215,7 @@ def plan_batch(trainer, model, inputs, num_items_in_batch):
     except Unsupported as exc:
         _warn_once(str(exc))
         return None
+    warmup.wait()
 
     B, S = ids.shape
     dev = ids.device
