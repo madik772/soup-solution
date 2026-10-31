@@ -50,7 +50,7 @@ from solution.rope import (
 )
 from solution.swiglu import swiglu_packed_bwd_, swiglu_packed_fwd
 from solution.unpad import inverse_map, row_gather
-from solution import warmup
+from solution import timeline, warmup
 
 F16 = torch.float16
 STEP_ATTR = "_soup_chunked_step"  # where Soup's rewind recorder looks for per-token losses
@@ -230,6 +230,7 @@ def plan_batch(trainer, model, inputs, num_items_in_batch):
         _warn_once(str(exc))
         return None
     warmup.wait()
+    timeline.stop_sampler()
 
     B, S = ids.shape
     dev = ids.device

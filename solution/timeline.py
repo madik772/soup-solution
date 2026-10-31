@@ -47,6 +47,40 @@ def _wrap(owner, name, label):
 
 
 _INSTALLED = []
+_SAMPLER = {"stop": None}
+
+
+def _sample_main_thread(main_id, stop, interval=0.05):
+    """Inclusive sample counts of (module, function) on the main thread's stack."""
+    import collections
+
+    counts = collections.Counter()
+    n = 0
+    while not stop.wait(interval):
+        frame = sys._current_frames().get(main_id)
+        seen = set()
+        while frame is not None:
+            path = frame.f_code.co_filename.replace("\\", "/")
+            for marker in ("site-packages/", "dist-packages/", "/lib/python3"):
+                if marker in path:
+                    path = path.split(marker, 1)[1]
+                    break
+            key = f"{path}:{frame.f_code.co_name}"
+            if key not in seen:
+                seen.add(key)
+                counts[key] += 1
+            frame = frame.f_back
+        n += 1
+    top = [f"{c * interval:5.1f}s {k}" for k, c in counts.most_common(45)]
+    print(f"[solution-timeline] main thread from apply() to the first step, {n} samples:\n  "
+          + "\n  ".join(top), file=sys.stderr, flush=True)
+
+
+def stop_sampler():
+    stop = _SAMPLER["stop"]
+    if stop is not None:
+        _SAMPLER["stop"] = None
+        stop.set()
 
 
 def install():
@@ -55,6 +89,12 @@ def install():
         return
     _INSTALLED.append(True)
     atexit.register(mark, "interpreter exit")
+    import threading
+
+    stop = threading.Event()
+    _SAMPLER["stop"] = stop
+    threading.Thread(target=_sample_main_thread, args=(threading.main_thread().ident, stop),
+                     name="solution-timeline-sampler", daemon=True).start()
     try:
         from soup_cli.trainer import sft
 

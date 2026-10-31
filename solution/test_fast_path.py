@@ -210,7 +210,8 @@ def test_rmsnorm_dropout_masks():
 
     torch.manual_seed(0)
     n, d, p = 512, 1536, 0.3
-    x = torch.randn(n, d, device="cuda")
+    # |x| >= 0.5: no kept value can round to an fp16 zero, so `!= 0` reads the mask exactly
+    x = torch.randn(n, d, device="cuda").sign() * (0.5 + torch.rand(n, d, device="cuda"))
     w = torch.rand(d, device="cuda") + 0.5
     y, rs, (d1, d2) = rmsnorm_drop_fwd(x, w, 1e-6, torch.float16, p, (123, 456))
     ref = (x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + 1e-6) * w)
