@@ -127,9 +127,14 @@ def _batch(vocab):
 
 
 @needs_cuda
-def test_packed_step_matches_transformers():
+@pytest.mark.parametrize("varlen", [True, False])
+@pytest.mark.parametrize("keep_budget", [0, 1 << 30])
+def test_packed_step_matches_transformers(monkeypatch, varlen, keep_budget):
+    """Both attention paths (varlen / padded SDPA), with every layer recomputed or kept."""
     from solution import fast_qwen2
 
+    monkeypatch.setattr(fast_qwen2, "KEEP_BUDGET_BYTES", keep_budget)
+    monkeypatch.setattr(fast_qwen2._STATE, "varlen", None if varlen else False)
     pm = _tiny_qlora_qwen2(dropout=0.0)
     inputs = _batch(pm.config.vocab_size)
     lora = [p for n, p in pm.named_parameters() if p.requires_grad]
@@ -151,6 +156,8 @@ def test_packed_step_matches_transformers():
                               label_smoother=None)
     plan = fast_qwen2.plan_batch(trainer, pm, dict(inputs), None)
     assert plan is not None
+    assert fast_qwen2._STATE.varlen is varlen  # the varlen kernel passed its self-test
+    assert all(plan.keep) == bool(keep_budget) and any(plan.keep) == bool(keep_budget)
     with torch.autocast("cuda", dtype=torch.float16):
         loss = fast_qwen2.causal_lm_forward(fast_qwen2._causal_lm(pm), plan)
     loss.backward()

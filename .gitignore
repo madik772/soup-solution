@@ -5,3 +5,7 @@ __pycache__/
 *.pyc
 .pytest_cache/
 .ipynb_checkpoints/
+
+# local working copies (the harness and the jury read solution/ only)
+solution_backup_1.47x/
+new solution/

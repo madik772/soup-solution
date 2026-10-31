@@ -25,6 +25,8 @@ padding, packed batches, ...) is detected before the step and goes through the o
 """
 
 import random
+import sys
+import time
 import warnings
 from types import SimpleNamespace
 
@@ -40,7 +42,12 @@ from solution.rmsnorm import (
     rmsnorm_drop_bwd,
     rmsnorm_drop_fwd,
 )
-from solution.rope import qkv_rope_pad, qkv_rope_pad_backward
+from solution.rope import (
+    qkv_rope_pack,
+    qkv_rope_pack_backward,
+    qkv_rope_pad,
+    qkv_rope_pad_backward,
+)
 from solution.swiglu import swiglu_packed_bwd_, swiglu_packed_fwd
 from solution.unpad import inverse_map, row_gather
 from solution import warmup
@@ -49,7 +56,13 @@ F16 = torch.float16
 STEP_ATTR = "_soup_chunked_step"  # where Soup's rewind recorder looks for per-token losses
 
 _SDPA = getattr(F, "_orig_scaled_dot_product_attention", F.scaled_dot_product_attention)
-_STATE = SimpleNamespace(plan=None, disabled=False, rng=None)
+_STATE = SimpleNamespace(plan=None, disabled=False, rng=None, varlen=None)
+
+# Activations kept for the backward pass instead of recomputed (gate|up output and the residual
+# sum, ~41 KB per token and layer), in at most this many bytes per step: the last layers of
+# the step keep theirs, the others recompute. The budget bounds the extra peak memory whatever
+# the batch length; short batches keep more layers.
+KEEP_BUDGET_BYTES = 256 * 2**20
 
 
 class Unsupported(Exception):
@@ -225,9 +238,10 @@ def plan_batch(trainer, model, inputs, num_items_in_batch):
     shift = torch.full_like(labels, -100)
     shift[:, :-1] = labels[:, 1:]
     lab_all = shift != -100
-    stats = torch.stack([right_padded.long(), lengths.sum(), lab_all.sum(),
-                         (lab_all & am_b).sum()]).tolist()
-    ok, n_real, n_lab_all, n_lab = stats
+    stats = torch.cat([torch.stack([right_padded.long(), lengths.sum(), lab_all.sum(),
+                                    (lab_all & am_b).sum()]), lengths.long()]).tolist()
+    ok, n_real, n_lab_all, n_lab = stats[:4]
+    row_lengths = [n for n in stats[4:] if n > 0]
     if not ok or n_lab_all != n_lab or n_real == 0 or n_lab == 0:
         return None
 
@@ -237,6 +251,14 @@ def plan_batch(trainer, model, inputs, num_items_in_batch):
     lab_pos = is_lab.nonzero().squeeze(1)
     unl_pos = (~is_lab).nonzero().squeeze(1)
     order = torch.cat([lab_pos, unl_pos])
+
+    cu = torch.tensor([0] + row_lengths, dtype=torch.int32).cumsum(0, dtype=torch.int32)
+    if _STATE.varlen is None:
+        _STATE.varlen = _varlen_attention_works(dev, infos[0])
+
+    per_token = infos[0].inter * 2 * 2 + infos[0].hidden * 4 + 4
+    n_keep = min(len(infos), KEEP_BUDGET_BYTES // max(1, n_real * per_token))
+    keep = [i >= len(infos) - n_keep for i in range(len(infos))]
 
     rotary = lm.model.rotary_emb
     cos, sin = rotary(torch.empty(0, device=dev, dtype=torch.float32),
@@ -258,7 +280,9 @@ def plan_batch(trainer, model, inputs, num_items_in_batch):
         lab_map=inverse_map(lab_pos, n_real),
         lab_flat_idx=real_idx[lab_pos],
         cos=cos[0].contiguous(), sin=sin[0].contiguous(),
-        seeds=seeds, denom=n_lab, lora16={},
+        seeds=seeds, denom=n_lab, lora16={}, keep=keep,
+        pos=(real_idx % S).to(torch.int32),
+        cu=cu.to(dev, non_blocking=True), max_len=max(row_lengths),
     )
 
 
@@ -285,7 +309,65 @@ def _qkv_forward(info, plan, h, seeds, params):
     return x, rs1, w_qkv, qkv, loras
 
 
+def _varlen_attention(q, k, v, plan, scale, need_lse):
+    """Causal attention of every packed sequence at once: PyTorch's memory-efficient kernel
+    with cu_seqlens (no padding, one launch). q, k, v: [1, N, H, D]."""
+    out = torch.ops.aten._efficient_attention_forward(
+        q, k, v, None, plan.cu, plan.cu, plan.max_len, plan.max_len, 0.0, 1, need_lse,
+        scale=scale)
+    return out[0]
+
+
+def _varlen_attention_works(dev, info):
+    """One small forward + backward against padded SDPA; False on any error or mismatch."""
+    try:
+        g = torch.Generator(device=dev).manual_seed(0)
+        lens = [5, 9, 3]
+        n, h, d = sum(lens), info.n_heads, info.head_dim
+        q, k, v = (torch.randn((1, n, h, d), device=dev, dtype=F16, generator=g).requires_grad_(True)
+                   for _ in range(3))
+        plan = SimpleNamespace(cu=torch.tensor([0, 5, 14, 17], device=dev, dtype=torch.int32),
+                               max_len=max(lens))
+        with torch.enable_grad():
+            out = _varlen_attention(q, k, v, plan, info.scale, True)
+            grads = torch.autograd.grad(out, (q, k, v), torch.ones_like(out))
+        start = 0
+        for n_i in lens:
+            sl = slice(start, start + n_i)
+            qs, ks, vs = (t.detach()[:, sl].transpose(1, 2).requires_grad_(True) for t in (q, k, v))
+            with torch.enable_grad():
+                ref = _SDPA(qs, ks, vs, is_causal=True, scale=info.scale)
+                ref_g = torch.autograd.grad(ref, (qs, ks, vs), torch.ones_like(ref))
+            same = torch.allclose(out[:, sl].transpose(1, 2).float(), ref.float(),
+                                  atol=2e-2, rtol=2e-2)
+            same = same and all(
+                torch.allclose(a[:, sl].transpose(1, 2).float(), r.float(), atol=5e-2, rtol=5e-2)
+                for a, r in zip(grads, ref_g))
+            if not same:
+                warnings.warn("solution: varlen attention disagrees with SDPA; using padded SDPA")
+                return False
+            start += n_i
+        return True
+    except Exception as exc:  # noqa: BLE001 - any failure: padded SDPA instead
+        warnings.warn(f"solution: varlen attention unavailable ({type(exc).__name__}: {exc}); "
+                      "using padded SDPA")
+        return False
+
+
 def _attention(info, plan, qkv, need_grad):
+    if _STATE.varlen:
+        q, k, v = qkv_rope_pack(qkv, plan.pos, plan.cos, plan.sin, info.n_heads, info.n_kv,
+                                info.head_dim)
+        if need_grad:
+            q = q.requires_grad_(True)
+            k = k.requires_grad_(True)
+            v = v.requires_grad_(True)
+            with torch.enable_grad():
+                o = _varlen_attention(q, k, v, plan, info.scale, True)
+        else:
+            o = _varlen_attention(q, k, v, plan, info.scale, False)
+        return o.view(plan.n_real, -1), (q, k, v, o)
+
     q, k, v = qkv_rope_pad(qkv, plan.pad_map, plan.cos, plan.sin, plan.B, plan.S,
                            info.n_heads, info.n_kv, info.head_dim)
     if need_grad:
@@ -304,43 +386,56 @@ def _attention(info, plan, qkv, need_grad):
 
 
 class _DecoderLayerFunction(torch.autograd.Function):
+    """One decoder layer on packed tokens. Saves its fp32 input; with `keep` also the residual
+    sum h2 and the gate|up output, so the backward does not recompute o_proj / gate|up."""
+
     @staticmethod
-    def forward(ctx, h, info, plan, seeds, *params):
+    def forward(ctx, h, info, plan, seeds, keep, *params):
         x, rs1, w_qkv, qkv, _ = _qkv_forward(info, plan, h, seeds, params)
         del x, rs1, w_qkv
         attn, _ = _attention(info, plan, qkv, need_grad=False)
         del qkv
         a = torch.mm(attn, info.o.dequant().t())
         del attn
-        h2, x2, _ = fused_add_rmsnorm_fwd(h, a, info.norm2_w, info.eps2, F16)
+        h2, x2, rs2 = fused_add_rmsnorm_fwd(h, a, info.norm2_w, info.eps2, F16)
         del a
         gu = torch.mm(x2, info.gu.dequant().t())
         del x2
         s = swiglu_packed_fwd(gu, info.inter)
-        del gu
-        h2.add_(torch.mm(s, info.down.dequant().t()))
-        ctx.save_for_backward(h, *params)
-        ctx.info, ctx.plan, ctx.seeds = info, plan, seeds
-        return h2
+        m = torch.mm(s, info.down.dequant().t())
+        del s
+        if keep:
+            out = torch.add(h2, m)
+            ctx.save_for_backward(h, h2, gu, rs2, *params)
+        else:
+            del gu
+            out = h2.add_(m)
+            ctx.save_for_backward(h, *params)
+        ctx.info, ctx.plan, ctx.seeds, ctx.keep = info, plan, seeds, keep
+        return out
 
     @staticmethod
     def backward(ctx, g):
         info, plan, seeds = ctx.info, ctx.plan, ctx.seeds
-        h, *params = ctx.saved_tensors
+        if ctx.keep:
+            h, h2, gu, rs2, *params = ctx.saved_tensors
+        else:
+            h, *params = ctx.saved_tensors
         g = g.contiguous()
 
-        # recompute everything the backward reads (down_proj's output is not one of them)
+        # recompute what the backward reads (down_proj's output is never one of them)
         x, rs1, w_qkv, qkv, loras = _qkv_forward(info, plan, h, seeds, params)
         attn, (q, k, v, o) = _attention(info, plan, qkv, need_grad=True)
         del qkv
         w_o = info.o.dequant()
-        a = torch.mm(attn, w_o.t())
-        del attn
-        h2, x2, rs2 = fused_add_rmsnorm_fwd(h, a, info.norm2_w, info.eps2, F16)
-        del a
         w_gu = info.gu.dequant()
-        gu = torch.mm(x2, w_gu.t())
-        del x2
+        if not ctx.keep:
+            a = torch.mm(attn, w_o.t())
+            h2, x2, rs2 = fused_add_rmsnorm_fwd(h, a, info.norm2_w, info.eps2, F16)
+            del a
+            gu = torch.mm(x2, w_gu.t())
+            del x2
+        del attn
 
         # MLP
         ds = torch.mm(g.to(F16), info.down.dequant())
@@ -354,12 +449,19 @@ class _DecoderLayerFunction(torch.autograd.Function):
         # attention
         d_attn = torch.mm(d_sum.to(F16), w_o)
         del w_o
-        d_o = row_gather(d_attn, plan.pad_map).view(plan.B, plan.S, info.n_heads, info.head_dim)
-        del d_attn
-        dq, dk, dv = torch.autograd.grad(o, (q, k, v), d_o.transpose(1, 2))
-        del o, q, k, v, d_o
-        d_qkv = qkv_rope_pad_backward(dq, dk, dv, plan.real_idx, plan.cos, plan.sin, plan.S,
-                                      info.n_heads, info.n_kv, info.head_dim)
+        if _STATE.varlen:
+            dq, dk, dv = torch.autograd.grad(o, (q, k, v), d_attn.view(o.shape))
+            del o, q, k, v, d_attn
+            d_qkv = qkv_rope_pack_backward(dq, dk, dv, plan.pos, plan.cos, plan.sin,
+                                           info.n_heads, info.n_kv, info.head_dim)
+        else:
+            d_o = row_gather(d_attn, plan.pad_map).view(plan.B, plan.S, info.n_heads,
+                                                        info.head_dim)
+            del d_attn
+            dq, dk, dv = torch.autograd.grad(o, (q, k, v), d_o.transpose(1, 2))
+            del o, q, k, v, d_o
+            d_qkv = qkv_rope_pad_backward(dq, dk, dv, plan.real_idx, plan.cos, plan.sin, plan.S,
+                                          info.n_heads, info.n_kv, info.head_dim)
         del dq, dk, dv
 
         # LoRA weight gradients, and the LoRA branches' gradient into the dropped inputs
@@ -386,7 +488,7 @@ class _DecoderLayerFunction(torch.autograd.Function):
                 for t in branch:
                     dx += t
                 dh = rmsnorm_drop_bwd(dx, h, info.norm1_w, rs1, d_res=d_sum)
-        return (dh, None, None, None, *grads)
+        return (dh, None, None, None, None, *grads)
 
 
 # --------------------------------------------------------------------------- model / trainer
@@ -405,8 +507,8 @@ def causal_lm_forward(lm, plan, num_items_in_batch=None):
     model = lm.model
     with torch.autocast("cuda", enabled=False):
         h = row_gather(model.embed_tokens.weight.detach(), plan.token_ids, out_dtype=torch.float32)
-        for info, seeds in zip(plan.infos, plan.seeds):
-            h = _DecoderLayerFunction.apply(h, info, plan, seeds, *info.params)
+        for info, seeds, keep in zip(plan.infos, plan.seeds, plan.keep):
+            h = _DecoderLayerFunction.apply(h, info, plan, seeds, keep, *info.params)
         hn = TritonRMSNormFunction.apply(h, model.norm.weight, model.norm.variance_epsilon, F16)
         del h
         plan.stats = SimpleNamespace()
@@ -439,11 +541,38 @@ def rewind_step(plan):
     return SimpleNamespace(token_loss=token_loss.view(plan.B, plan.S))
 
 
+# Diagnostics for a few steps: where a step's wall time goes (CPU issue vs GPU wait).
+DIAG_STEPS = range(3, 9)
+_DIAG = SimpleNamespace(step=0, prev=None)
+
+
+def _diag_report(now):
+    d = _DIAG.prev
+    if d is None:
+        return
+    _DIAG.prev = None
+    period = (now - d["t0"]) * 1000
+    parts = {k: v * 1000 for k, v in d.items() if k not in ("t0", "_step")}
+    rest = period - sum(parts.values())
+    print(f"[solution-step] step {d_step(d)}: {period:6.1f} ms = "
+          + " | ".join(f"{k} {v:5.1f}" for k, v in parts.items()) + f" | rest {rest:5.1f}",
+          file=sys.stderr, flush=True)
+
+
+def d_step(d):
+    return d.get("_step", "?")
+
+
 def make_compute_loss(original):
     """TRL SFTTrainer.compute_loss with the packed step when the batch and model allow it."""
     from transformers import Trainer
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+        t0 = time.perf_counter()
+        _diag_report(t0)
+        step = _DIAG.step
+        _DIAG.step += 1
+        diag = step in DIAG_STEPS and torch.cuda.is_available()
         try:
             plan = plan_batch(self, model, inputs, num_items_in_batch)
         except Exception as exc:  # noqa: BLE001 - a planning failure must not stop training
@@ -452,6 +581,7 @@ def make_compute_loss(original):
         if plan is None:
             return original(self, model, inputs, return_outputs=return_outputs,
                             num_items_in_batch=num_items_in_batch)
+        t1 = time.perf_counter()
         mode = "train" if self.model.training else "eval"
         inputs.pop("_prediction_loss_only", None)
         inputs["use_cache"] = False
@@ -463,8 +593,32 @@ def make_compute_loss(original):
             _STATE.plan = None
         if not plan.consumed:
             raise RuntimeError("solution: the packed step was planned but the model did not run it")
+        t2 = time.perf_counter()
+        if diag:
+            torch.cuda.synchronize()
+        t3 = time.perf_counter()
         log_trl_metrics(self, mode, inputs, plan)
         setattr(self, STEP_ATTR, rewind_step(plan))
+        t4 = time.perf_counter()
+        if diag:
+            times = {"_step": step, "t0": t0, "plan": t1 - t0, "fwd issue": t2 - t1,
+                     "fwd gpu": t3 - t2, "metrics": t4 - t3}
+            _DIAG.prev = times
+            acc = self.accelerator
+            plain_backward = acc.backward
+
+            def timed_backward(*args, **kwargs):
+                b0 = time.perf_counter()
+                try:
+                    return plain_backward(*args, **kwargs)
+                finally:
+                    b1 = time.perf_counter()
+                    torch.cuda.synchronize()
+                    times["bwd issue"] = b1 - b0
+                    times["bwd gpu"] = time.perf_counter() - b1
+                    acc.backward = plain_backward
+
+            acc.backward = timed_backward
         return (loss, outputs) if return_outputs else loss
 
     compute_loss._soup_fast = True

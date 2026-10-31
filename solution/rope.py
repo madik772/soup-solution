@@ -192,7 +192,7 @@ def rope(x, cos, sin):
 
 @triton.jit(do_not_specialize=["seq_len"])
 def _custom_qkv_rope_pad_fwd_kernel(
-    QKV, Map, Cos, Sin, Qp, Kp, Vp,
+    QKV, Map, Pos, Cos, Sin, Qp, Kp, Vp,
     stride_qkv, stride_cos, seq_len,
     N_HEADS: tl.constexpr,
     N_KV: tl.constexpr,
@@ -200,16 +200,23 @@ def _custom_qkv_rope_pad_fwd_kernel(
     HALF: tl.constexpr,
     GROUP: tl.constexpr,
     BLOCK_H: tl.constexpr,
+    PACKED: tl.constexpr,
 ):
+    # PACKED: output row i is packed token i at position Pos[i] (varlen attention reads it).
+    # Otherwise output row i is padded position i = b * seq_len + s, filled from packed row
+    # Map[i] (zeros where Map[i] < 0).
     row = tl.program_id(0).to(tl.int64)
-    src = tl.load(Map + row).to(tl.int64)
-    valid = src >= 0
-    pos = row % seq_len
-
     h = tl.arange(0, BLOCK_H)[:, None]
     d = tl.arange(0, HALF)[None, :]
     hmask = h < N_HEADS
-    lmask = hmask & valid
+    if PACKED:
+        src = row
+        pos = tl.load(Pos + row).to(tl.int64)
+        lmask = hmask
+    else:
+        src = tl.load(Map + row).to(tl.int64)
+        pos = row % seq_len
+        lmask = hmask & (src >= 0)
 
     c1 = tl.load(Cos + pos * stride_cos + d).to(tl.float32)
     c2 = tl.load(Cos + pos * stride_cos + HALF + d).to(tl.float32)
@@ -252,11 +259,20 @@ def _custom_qkv_rope_pad_bwd_kernel(
     GROUP: tl.constexpr,
     BLOCK_H: tl.constexpr,
     BLOCK_G: tl.constexpr,
+    PACKED: tl.constexpr,
 ):
+    # PACKED: the gradients are [1, N, H, D] in packed token order and Idx holds positions;
+    # otherwise they are [B, H, S, D] (any strides) and Idx holds padded flat positions.
     row = tl.program_id(0).to(tl.int64)
-    flat = tl.load(Idx + row).to(tl.int64)
-    b = flat // seq_len
-    pos = flat % seq_len
+    if PACKED:
+        b = 0
+        pos = tl.load(Idx + row).to(tl.int64)
+        tok = row
+    else:
+        flat = tl.load(Idx + row).to(tl.int64)
+        b = flat // seq_len
+        pos = flat % seq_len
+        tok = pos
 
     d = tl.arange(0, HALF)[None, :]
     c1 = tl.load(Cos + pos * stride_cos + d).to(tl.float32)
@@ -267,7 +283,7 @@ def _custom_qkv_rope_pad_bwd_kernel(
 
     h = tl.arange(0, BLOCK_H)[:, None]
     hmask = h < N_HEADS
-    q_ptr = dQ + b * sq_b + pos * sq_s + h * sq_h
+    q_ptr = dQ + b * sq_b + tok * sq_s + h * sq_h
     g1 = tl.load(q_ptr + d, mask=hmask, other=0.0).to(tl.float32)
     g2 = tl.load(q_ptr + HALF + d, mask=hmask, other=0.0).to(tl.float32)
     tl.store(out_ptr + h * HEAD_DIM + d, (g1 * c1 + g2 * s2).to(dQKV.dtype.element_ty), mask=hmask)
@@ -279,7 +295,7 @@ def _custom_qkv_rope_pad_bwd_kernel(
     d1 = tl.arange(0, HALF)
     for kv in tl.static_range(N_KV):
         heads = kv * GROUP + g
-        k_ptr = dK + b * sk_b + pos * sk_s + heads * sk_h
+        k_ptr = dK + b * sk_b + tok * sk_s + heads * sk_h
         k1 = tl.load(k_ptr + d, mask=gmask, other=0.0).to(tl.float32)
         k2 = tl.load(k_ptr + HALF + d, mask=gmask, other=0.0).to(tl.float32)
         dk1 = tl.sum(k1 * c1 + k2 * s2, axis=0)
@@ -288,7 +304,7 @@ def _custom_qkv_rope_pad_bwd_kernel(
         tl.store(k_out + d1, dk1.to(dQKV.dtype.element_ty))
         tl.store(k_out + HALF + d1, dk2.to(dQKV.dtype.element_ty))
 
-        v_ptr = dV + b * sv_b + pos * sv_s + heads * sv_h
+        v_ptr = dV + b * sv_b + tok * sv_s + heads * sv_h
         v1 = tl.load(v_ptr + d, mask=gmask, other=0.0).to(tl.float32)
         v2 = tl.load(v_ptr + HALF + d, mask=gmask, other=0.0).to(tl.float32)
         v_out = out_ptr + (N_HEADS + N_KV) * HEAD_DIM + kv * HEAD_DIM
@@ -305,11 +321,11 @@ def qkv_rope_pad(qkv, row_map, cos, sin, batch, seq_len, n_heads, n_kv, head_dim
     kp = torch.empty(shape, device=qkv.device, dtype=qkv.dtype)
     vp = torch.empty(shape, device=qkv.device, dtype=qkv.dtype)
     _custom_qkv_rope_pad_fwd_kernel[(n_pos,)](
-        qkv, row_map, cos, sin, qp, kp, vp,
+        qkv, row_map, row_map, cos, sin, qp, kp, vp,
         qkv.stride(0), cos.stride(0), seq_len,
         N_HEADS=n_heads, N_KV=n_kv, HEAD_DIM=head_dim,
         HALF=head_dim // 2, GROUP=n_heads // n_kv,
-        BLOCK_H=triton.next_power_of_2(n_heads),
+        BLOCK_H=triton.next_power_of_2(n_heads), PACKED=False,
         num_warps=4, num_stages=2,
     )
 
@@ -334,7 +350,47 @@ def qkv_rope_pad_backward(dq, dk, dv, real_idx, cos, sin, seq_len, n_heads, n_kv
         N_HEADS=n_heads, N_KV=n_kv, HEAD_DIM=head_dim,
         HALF=head_dim // 2, GROUP=n_heads // n_kv,
         BLOCK_H=triton.next_power_of_2(n_heads),
-        BLOCK_G=triton.next_power_of_2(n_heads // n_kv),
+        BLOCK_G=triton.next_power_of_2(n_heads // n_kv), PACKED=False,
+        num_warps=4, num_stages=2,
+    )
+    return out
+
+
+def qkv_rope_pack(qkv, pos, cos, sin, n_heads, n_kv, head_dim):
+    """Packed fused projection [N, (H + 2*KV) * D] -> rotated q, k and v with the KV heads
+    repeated, each [1, N, H, D] (the layout of varlen attention)."""
+    n_tok = qkv.shape[0]
+    shape = (1, n_tok, n_heads, head_dim)
+    qp = torch.empty(shape, device=qkv.device, dtype=qkv.dtype)
+    kp = torch.empty(shape, device=qkv.device, dtype=qkv.dtype)
+    vp = torch.empty(shape, device=qkv.device, dtype=qkv.dtype)
+    _custom_qkv_rope_pad_fwd_kernel[(n_tok,)](
+        qkv, pos, pos, cos, sin, qp, kp, vp,
+        qkv.stride(0), cos.stride(0), 1,
+        N_HEADS=n_heads, N_KV=n_kv, HEAD_DIM=head_dim,
+        HALF=head_dim // 2, GROUP=n_heads // n_kv,
+        BLOCK_H=triton.next_power_of_2(n_heads), PACKED=True,
+        num_warps=4, num_stages=2,
+    )
+    return qp, kp, vp
+
+
+def qkv_rope_pack_backward(dq, dk, dv, pos, cos, sin, n_heads, n_kv, head_dim):
+    """Gradients of `qkv_rope_pack` w.r.t. its packed input, [N, (H + 2*KV) * D]."""
+    n_tok = pos.numel()
+    out = torch.empty((n_tok, (n_heads + 2 * n_kv) * head_dim), device=dq.device, dtype=dq.dtype)
+    for t in (dq, dk, dv):
+        assert t.stride(3) == 1
+    _custom_qkv_rope_pad_bwd_kernel[(n_tok,)](
+        dq, dk, dv, pos, cos, sin, out,
+        0, dq.stride(2), dq.stride(1),
+        0, dk.stride(2), dk.stride(1),
+        0, dv.stride(2), dv.stride(1),
+        out.stride(0), cos.stride(0), 1,
+        N_HEADS=n_heads, N_KV=n_kv, HEAD_DIM=head_dim,
+        HALF=head_dim // 2, GROUP=n_heads // n_kv,
+        BLOCK_H=triton.next_power_of_2(n_heads),
+        BLOCK_G=triton.next_power_of_2(n_heads // n_kv), PACKED=True,
         num_warps=4, num_stages=2,
     )
     return out

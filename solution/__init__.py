@@ -176,9 +176,14 @@ def _get_mlp_compute_dtype(mlp):
 
 
 def _install_fast_path():
-    from solution import warmup
+    from solution import timeline, warmup
 
     warmup.start()
+    try:
+        if torch.cuda.is_available() and torch.cuda.is_initialized():
+            timeline.install()
+    except Exception:
+        pass
     try:
         from transformers.models.qwen2 import modeling_qwen2
 
