@@ -258,7 +258,7 @@ def plan_batch(trainer, model, inputs, num_items_in_batch):
         lab_map=inverse_map(lab_pos, n_real),
         lab_flat_idx=real_idx[lab_pos],
         cos=cos[0].contiguous(), sin=sin[0].contiguous(),
-        seeds=seeds, denom=n_lab,
+        seeds=seeds, denom=n_lab, lora16={},
     )
 
 
@@ -273,9 +273,12 @@ def _qkv_forward(info, plan, h, seeds, params):
         drops = [x] * len(info.loras)
     w_qkv = info.qkv.dequant()
     qkv = torch.addmm(info.qkv_bias, x, w_qkv.t())
+    w16 = plan.lora16.get(id(info))
+    if w16 is None:  # fp16 copies of this step's LoRA weights, shared by forward and recompute
+        w16 = plan.lora16[id(info)] = [p.detach().to(F16) for p in params]
     loras = []
     for i, ((c0, c1, spec), xd) in enumerate(zip(info.loras, drops)):
-        a16, b16 = params[2 * i].to(F16), params[2 * i + 1].to(F16)
+        a16, b16 = w16[2 * i], w16[2 * i + 1]
         xa = torch.mm(xd, a16.t())
         qkv[:, c0:c1].addmm_(xa, b16.t(), alpha=spec.scaling)
         loras.append((c0, c1, spec.scaling, a16, b16, xd, xa))

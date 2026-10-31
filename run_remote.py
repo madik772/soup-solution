@@ -195,7 +195,7 @@ DIAGNOSTICS_MARKER = "# soup-remote-diagnostics"
 DIAGNOSTICS_SOURCE = (
     f"{DIAGNOSTICS_MARKER}\n"
     "!cd /kaggle/working/repo && for f in runs/*/train.log; do echo \"===== $f\"; "
-    "grep -n -i -E 'error|traceback|warn|fast path|exception' $f | tail -n 25; "
+    "grep -n -i -E 'error|traceback|warn|fast path|exception|\\[solution\\]' $f | tail -n 25; "
     "tail -n 40 $f; done\n"
     "import json, glob\n"
     "for path in sorted(glob.glob('/kaggle/working/repo/runs/*/metrics.json')):\n"
@@ -203,6 +203,17 @@ DIAGNOSTICS_SOURCE = (
     "    keep = ('apply_s', 'train_loop_s', 'median_step_s', 'timed_loop_s', "
     "'torch_max_allocated_mib', 'torch_max_reserved_mib', 'own_kernel_ms')\n"
     "    print('=====', path, {k: m.get(k) for k in keep}, 'steps', m.get('step_s', [])[:8])\n"
+    "!cd /kaggle/working/repo && python harness/run_task.py --only solution --profile --out runs_prof "
+    "> runs_prof.log 2>&1; tail -n 3 runs_prof.log\n"
+    "try:\n"
+    "    pr = json.load(open('/kaggle/working/repo/runs_prof/solution_profile/profile.json'))\n"
+    "    act = pr['active_steps']\n"
+    "    print('PROFILE gpu ms/step', round(pr['total_gpu_us'] / act / 1000, 2))\n"
+    "    for r in pr['kernels'][:40]:\n"
+    "        print(f\"PROFILE {r['time_us'] / act / 1000:8.2f} ms/step {r['count'] // act:5d}/step  \"\n"
+    "              f\"{r['name'][:120]}\")\n"
+    "except Exception as exc:\n"
+    "    print('PROFILE failed', exc)\n"
 )
 
 

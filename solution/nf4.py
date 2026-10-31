@@ -16,39 +16,40 @@ import torch
 import triton
 import triton.language as tl
 
-BLOCK_BYTES = 1024
+QBLOCKS_PER_PROGRAM = 32
 
 
-@triton.jit(do_not_specialize=["n_bytes"])
+@triton.jit(do_not_specialize=["n_qblocks"])
 def _custom_nf4_dequant_kernel(
     Packed, AbsQ, Abs2, Code, Code2, Offset, Out,
-    n_bytes,
+    n_qblocks,
+    QBLOCK: tl.constexpr,
     QBLOCK_HALF: tl.constexpr,
     QBLOCK2: tl.constexpr,
     NESTED: tl.constexpr,
-    BLOCK_BYTES: tl.constexpr,
-    BLOCK_OUT: tl.constexpr,
+    ROWS: tl.constexpr,
 ):
+    # One tile = ROWS quantization blocks x QBLOCK elements: the block scale is read once per
+    # row of the tile (not per byte) and broadcast over its QBLOCK / 2 packed bytes.
     pid = tl.program_id(0).to(tl.int64)
-    byte_idx = pid * BLOCK_BYTES + tl.arange(0, BLOCK_BYTES)
-    in_range = byte_idx < n_bytes
+    blk = pid * ROWS + tl.arange(0, ROWS)
+    blk_ok = blk < n_qblocks
+    if NESTED:
+        aq = tl.load(AbsQ + blk, mask=blk_ok, other=0).to(tl.int32)
+        scale = tl.load(Code2 + aq) * tl.load(Abs2 + blk // QBLOCK2, mask=blk_ok, other=0.0)
+        scale = scale + tl.load(Offset)
+    else:
+        scale = tl.load(AbsQ + blk, mask=blk_ok, other=0.0).to(tl.float32)
+    scale = scale[:, None]
 
-    packed = tl.load(Packed + byte_idx, mask=in_range, other=0).to(tl.int32)
+    byte_idx = blk[:, None] * QBLOCK_HALF + tl.arange(0, QBLOCK_HALF)[None, :]
+    packed = tl.load(Packed + byte_idx, mask=blk_ok[:, None], other=0).to(tl.int32)
     first = tl.load(Code + (packed >> 4))
     second = tl.load(Code + (packed & 15))
 
-    # Both nibbles of a byte share one quantization block (blocks hold an even count).
-    block = byte_idx // QBLOCK_HALF
-    if NESTED:
-        aq = tl.load(AbsQ + block, mask=in_range, other=0).to(tl.int32)
-        scale = tl.load(Code2 + aq) * tl.load(Abs2 + block // QBLOCK2, mask=in_range, other=0.0)
-        scale = scale + tl.load(Offset)
-    else:
-        scale = tl.load(AbsQ + block, mask=in_range, other=0.0).to(tl.float32)
-
     vals = tl.interleave(first * scale, second * scale)
-    out_idx = pid * BLOCK_OUT + tl.arange(0, BLOCK_OUT)
-    tl.store(Out + out_idx, vals.to(Out.dtype.element_ty), mask=out_idx < 2 * n_bytes)
+    out_idx = blk[:, None] * QBLOCK + tl.arange(0, QBLOCK)[None, :]
+    tl.store(Out + out_idx, vals.to(Out.dtype.element_ty), mask=blk_ok[:, None])
 
 
 class NF4Weight:
@@ -86,7 +87,8 @@ class NF4Weight:
             return False
         if len(getattr(qs, "shape", ())) != 2 or (qs.shape[0] * qs.shape[1]) % 2:
             return False
-        if int(qs.blocksize) % 2 or not param.is_cuda:
+        bs = int(qs.blocksize)
+        if bs < 2 or bs & (bs - 1) or (qs.shape[0] * qs.shape[1]) % bs or not param.is_cuda:
             return False
         if getattr(qs, "nested", False) and getattr(qs, "state2", None) is None:
             return False
@@ -94,15 +96,16 @@ class NF4Weight:
 
     def dequant_into(self, out):
         """Write the [N, K] weight into `out` (contiguous, N*K elements)."""
-        grid = (triton.cdiv(self.n_bytes, BLOCK_BYTES),)
+        n_qblocks = (self.shape[0] * self.shape[1]) // self.blocksize
+        grid = (triton.cdiv(n_qblocks, QBLOCKS_PER_PROGRAM),)
         _custom_nf4_dequant_kernel[grid](
             self.packed, self.absq, self.abs2, self.code, self.code2, self.offset, out,
-            self.n_bytes,
+            n_qblocks,
+            QBLOCK=self.blocksize,
             QBLOCK_HALF=self.blocksize // 2,
             QBLOCK2=self.block2,
             NESTED=self.nested,
-            BLOCK_BYTES=BLOCK_BYTES,
-            BLOCK_OUT=2 * BLOCK_BYTES,
+            ROWS=QBLOCKS_PER_PROGRAM,
             num_warps=4,
             num_stages=2,
         )
