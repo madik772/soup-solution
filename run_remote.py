@@ -195,7 +195,7 @@ DIAGNOSTICS_MARKER = "# soup-remote-diagnostics"
 DIAGNOSTICS_SOURCE = (
     f"{DIAGNOSTICS_MARKER}\n"
     "!cd /kaggle/working/repo && for f in runs/*/train.log; do echo \"===== $f\"; "
-    "grep -n -i -E 'error|traceback|warn|fast path|exception|\\[solution' $f | tail -n 45; "
+    "grep -n -i -E 'error|traceback|warn|fast path|exception|\\[solution' $f | tail -n 80; "
     "tail -n 40 $f; done\n"
     "import json, glob\n"
     "for path in sorted(glob.glob('/kaggle/working/repo/runs/*/metrics.json')):\n"
@@ -214,6 +214,8 @@ DIAGNOSTICS_SOURCE = (
     "              f\"{r['name'][:120]}\")\n"
     "except Exception as exc:\n"
     "    print('PROFILE failed', exc)\n"
+    "!cd /kaggle/working/repo && test -f tools/nf4_bench.py && python tools/nf4_bench.py 2>&1 | tail -n 12\n"
+    "!cd /kaggle/working/repo && test -f tools/mask_probe.py && python tools/mask_probe.py 2>&1 | tail -n 12\n"
 )
 
 

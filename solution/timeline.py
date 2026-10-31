@@ -72,8 +72,8 @@ def _sample_main_thread(main_id, stop, interval=0.05):
             frame = frame.f_back
         n += 1
     top = [f"{c * interval:5.1f}s {k}" for k, c in counts.most_common(45)]
-    print(f"[solution-timeline] main thread from apply() to the first step, {n} samples:\n  "
-          + "\n  ".join(top), file=sys.stderr, flush=True)
+    print(f"[solution-timeline] main thread from apply() to the first step, {n} samples:\n"
+          + "\n".join(f"[solution-sample] {line}" for line in top), file=sys.stderr, flush=True)
 
 
 def stop_sampler():
