@@ -354,3 +354,133 @@ class ChunkedCrossEntropyFunction(torch.autograd.Function):
             None,
             None,
         )
+
+
+# ---------------------------------------------------------------------------------------------
+# Output head + loss + TRL's metrics without the [B, S, vocab] logits.
+#
+# The packed real tokens are ordered labelled-first. Chunk by chunk, one GEMM gives the fp16
+# logits (as transformers' fp16 head does), and one kernel pass per row reads them once with an
+# online max / sum-exp / sum(exp * x) to get log-sum-exp, the entropy TRL logs (every real
+# token) and the argmax for its token accuracy; for labelled rows it then takes the target
+# logit, writes the token loss, and overwrites the logits with (softmax - onehot) * GRAD_SCALE,
+# the loss gradient, which a second GEMM takes back to the hidden states. Prompt rows skip the
+# gradient, so that GEMM only covers the answer tokens, and nothing is recomputed in backward:
+# the gradient is scaled by the incoming loss scale / denominator there.
+#
+# GRAD_SCALE keeps small probabilities representable in fp16, the role fp16 loss scaling plays
+# in the unfused step (where the scaled fp32 gradient is rounded to fp16 for the head GEMM).
+# ---------------------------------------------------------------------------------------------
+
+CE_CHUNK = 512
+CE_BLOCK_V = 2048
+GRAD_SCALE = 1024.0
+
+
+@triton.jit(do_not_specialize=["n_lab"])
+def _custom_lmhead_ce_kernel(
+    Logits, Targets, Loss, Ent, Correct,
+    stride_row, n_lab, V, grad_scale,
+    BLOCK_V: tl.constexpr,
+):
+    row = tl.program_id(0).to(tl.int64)
+    ptr = Logits + row * stride_row
+
+    m = -float("inf")
+    s = 0.0
+    t = 0.0
+    best = -float("inf")
+    best_idx = 0
+    for off in range(0, V, BLOCK_V):
+        cols = off + tl.arange(0, BLOCK_V)
+        mask = cols < V
+        x = tl.load(ptr + cols, mask=mask, other=-float("inf")).to(tl.float32)
+        blk_max = tl.max(x, axis=0)
+        blk_arg = tl.argmax(x, axis=0)
+        best_idx = tl.where(blk_max > best, off + blk_arg, best_idx)
+        best = tl.maximum(best, blk_max)
+        m_new = tl.maximum(m, blk_max)
+        alpha = tl.exp(m - m_new)
+        e = tl.exp(x - m_new)
+        s = s * alpha + tl.sum(e, axis=0)
+        t = t * alpha + tl.sum(tl.where(mask, e * x, 0.0), axis=0)
+        m = m_new
+
+    lse = m + tl.log(s)
+    tl.store(Ent + row, lse - t / s)
+
+    if row < n_lab:
+        tgt = tl.load(Targets + row).to(tl.int64)
+        x_t = tl.load(ptr + tgt).to(tl.float32)
+        tl.store(Loss + row, lse - x_t)
+        tl.store(Correct + row, (best_idx == tgt).to(tl.int32))
+        for off in range(0, V, BLOCK_V):
+            cols = off + tl.arange(0, BLOCK_V)
+            mask = cols < V
+            x = tl.load(ptr + cols, mask=mask, other=0.0).to(tl.float32)
+            p = tl.exp(x - lse)
+            g = tl.where(cols == tgt, p - 1.0, p) * grad_scale
+            tl.store(ptr + cols, g.to(Logits.dtype.element_ty), mask=mask)
+
+
+class LMHeadLossFunction(torch.autograd.Function):
+    """loss = sum of the labelled tokens' cross-entropy / denom, from packed hidden states.
+
+    `stats` (a plain object) receives the per-token entropy of every real token, the labelled
+    tokens' losses and argmax hits in labelled-first order; `plan` carries that order.
+    """
+
+    @staticmethod
+    def forward(ctx, hidden, weight, plan, stats):
+        from solution.unpad import row_gather
+
+        n_real, d = hidden.shape
+        n_lab = plan.n_lab
+        vocab = weight.shape[0]
+        dev = hidden.device
+        hidden_sorted = row_gather(hidden, plan.order)
+        loss_tok = torch.empty(n_lab, device=dev, dtype=torch.float32)
+        correct = torch.empty(n_lab, device=dev, dtype=torch.int32)
+        ent = torch.empty(n_real, device=dev, dtype=torch.float32)
+        d_sorted = torch.empty((n_lab, d), device=dev, dtype=hidden.dtype)
+
+        chunk = min(CE_CHUNK, n_real)
+        buf = torch.empty((chunk, vocab), device=dev, dtype=hidden.dtype)
+        w_t = weight.t()
+        for start in range(0, n_real, chunk):
+            end = min(start + chunk, n_real)
+            rows = end - start
+            logits = buf[:rows]
+            torch.mm(hidden_sorted[start:end], w_t, out=logits)
+            lab_rows = max(0, min(end, n_lab) - start)
+            _custom_lmhead_ce_kernel[(rows,)](
+                logits, plan.tgt_sorted[start:],
+                loss_tok[start:] if lab_rows else loss_tok,
+                ent[start:],
+                correct[start:] if lab_rows else correct,
+                logits.stride(0), lab_rows, vocab, GRAD_SCALE,
+                BLOCK_V=CE_BLOCK_V,
+                num_warps=8,
+                num_stages=2,
+            )
+            if lab_rows:
+                torch.mm(logits[:lab_rows], weight, out=d_sorted[start:start + lab_rows])
+        del buf, hidden_sorted
+
+        stats.ent, stats.loss_tok, stats.correct = ent, loss_tok, correct
+        denom = plan.denom
+        loss = loss_tok.sum() / denom
+        ctx.save_for_backward(d_sorted)
+        ctx.plan = plan
+        ctx.denom = denom
+        ctx.n_real = n_real
+        return loss
+
+    @staticmethod
+    def backward(ctx, grad_loss):
+        from solution.unpad import row_gather
+
+        (d_sorted,) = ctx.saved_tensors
+        scale = (grad_loss.float() / (ctx.denom * GRAD_SCALE)).reshape(1)
+        d_hidden = row_gather(d_sorted, ctx.plan.lab_map, n_rows=ctx.n_real, scale=scale)
+        return d_hidden, None, None, None

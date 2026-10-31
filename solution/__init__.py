@@ -20,6 +20,7 @@ from solution.unpad import (
     set_active_attention_mask,
     get_active_attention_mask,
 )
+from solution import fast_qwen2
 
 _DEFERRED_RESIDUAL_ACTIVE = False
 
@@ -222,6 +223,32 @@ def _get_mlp_compute_dtype(mlp):
         qs = getattr(getattr(mlp.gate_proj, "weight", None), "quant_state", None)
         cd = getattr(qs, "dtype", None)
     return cd
+
+
+def _install_fast_path():
+    try:
+        from transformers.models.qwen2 import modeling_qwen2
+
+        clm = modeling_qwen2.Qwen2ForCausalLM
+        if not getattr(clm.forward, "_soup_fast", False):
+            clm.forward = fast_qwen2.make_lm_forward(clm.forward)
+    except Exception:
+        pass
+    try:
+        from trl import SFTTrainer
+
+        if not getattr(SFTTrainer.compute_loss, "_soup_fast", False):
+            SFTTrainer.compute_loss = fast_qwen2.make_compute_loss(SFTTrainer.compute_loss)
+    except Exception:
+        pass
+    try:
+        import peft
+
+        prepare = getattr(peft, "prepare_model_for_kbit_training", None)
+        if prepare is not None and not getattr(prepare, "_soup_fast", False):
+            peft.prepare_model_for_kbit_training = fast_qwen2.make_prepare_kbit(prepare)
+    except Exception:
+        pass
 
 
 def apply(model=None):
@@ -458,7 +485,11 @@ def apply(model=None):
     F.cross_entropy = custom_cross_entropy
     nn.CrossEntropyLoss.forward = custom_ce_forward
 
-    # 7. Configure model instance if provided
+    # 7. Packed training step (solution/fast_qwen2.py): the trainer plans each batch, the causal
+    #    LM runs it end to end on the real tokens, and the frozen tied embedding stays fp16.
+    _install_fast_path()
+
+    # 8. Configure model instance if provided
     if model is not None:
         if hasattr(model, "gradient_checkpointing_enable"):
             try:

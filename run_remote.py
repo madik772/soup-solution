@@ -191,7 +191,33 @@ def pull_kernel_blob(headers: dict[str, str], username: str, key: str) -> dict:
     raise RuntimeError("Could not obtain notebook text from Kaggle pull or templates/kaggle_notebook.ipynb")
 
 
+DIAGNOSTICS_MARKER = "# soup-remote-diagnostics"
+DIAGNOSTICS_SOURCE = (
+    f"{DIAGNOSTICS_MARKER}\n"
+    "!cd /kaggle/working/repo && for f in runs/*/train.log; do echo \"===== $f\"; "
+    "grep -n -i -E 'error|traceback|warn|fast path|exception' $f | tail -n 25; "
+    "tail -n 40 $f; done\n"
+)
+
+
+def add_diagnostics_cell(blob: dict) -> dict:
+    """Append a cell that prints the end of every run's train.log (failures are otherwise silent)."""
+    try:
+        nb = json.loads(blob["text"])
+    except (KeyError, TypeError, ValueError):
+        return blob
+    cells = nb.get("cells")
+    if not isinstance(cells, list):
+        return blob
+    if any(DIAGNOSTICS_MARKER in "".join(c.get("source", "")) for c in cells if isinstance(c, dict)):
+        return blob
+    cells.append({"cell_type": "code", "execution_count": None, "metadata": {}, "outputs": [],
+                  "source": DIAGNOSTICS_SOURCE.splitlines(keepends=True)})
+    return dict(blob, text=json.dumps(nb, ensure_ascii=False))
+
+
 def push_kernel(headers: dict[str, str], blob: dict, username: str, key: str) -> dict:
+    blob = add_diagnostics_cell(blob)
     url = f"{BASE_URL}/kernels/push"
     payload = {
         "slug": f"{USER_NAME}/{KERNEL_SLUG}",

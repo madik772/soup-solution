@@ -154,3 +154,47 @@ class TritonSwiGLUFunction(torch.autograd.Function):
 
 def swiglu(gate, up):
     return TritonSwiGLUFunction.apply(gate, up)
+
+
+def swiglu_packed_fwd(gate_up, n_cols):
+    """silu(gate) * up for a fused [M, 2 * n_cols] gate|up projection (one GEMM for both)."""
+    M = gate_up.shape[0]
+    gate = gate_up[:, :n_cols]
+    up = gate_up[:, n_cols:]
+    out = torch.empty((M, n_cols), device=gate_up.device, dtype=gate_up.dtype)
+    if M == 0:
+        return out
+    _custom_fused_swiglu_fwd_kernel[(M,)](
+        gate, up, out,
+        gate.stride(0), gate.stride(1),
+        up.stride(0), up.stride(1),
+        out.stride(0), out.stride(1),
+        n_cols,
+        BLOCK_SIZE=BLOCK_SIZE,
+        num_warps=8,
+        num_stages=2,
+    )
+    return out
+
+
+def swiglu_packed_bwd_(grad_out, gate_up, n_cols):
+    """Overwrite the fused gate|up buffer with (d gate | d up): it is then the gradient of the
+    fused projection's output, and one GEMM takes it back to the layer input."""
+    M = gate_up.shape[0]
+    if M == 0:
+        return gate_up
+    gate = gate_up[:, :n_cols]
+    up = gate_up[:, n_cols:]
+    _custom_fused_swiglu_bwd_kernel[(M,)](
+        grad_out, gate, up, gate, up,
+        grad_out.stride(0), grad_out.stride(1),
+        gate.stride(0), gate.stride(1),
+        up.stride(0), up.stride(1),
+        gate.stride(0), gate.stride(1),
+        up.stride(0), up.stride(1),
+        n_cols,
+        BLOCK_SIZE=BLOCK_SIZE,
+        num_warps=8,
+        num_stages=2,
+    )
+    return gate_up

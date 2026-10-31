@@ -248,3 +248,160 @@ class TritonFusedAddRMSNormFunction(torch.autograd.Function):
 
 def fused_add_rmsnorm(residual, x, weight, eps=1e-6, out_dtype=None):
     return TritonFusedAddRMSNormFunction.apply(residual, x, weight, eps, out_dtype)
+
+
+# ---------------------------------------------------------------------------------------------
+# input_layernorm of the packed decoder layer, with the LoRA dropout of the projections that
+# read it (q_proj and v_proj in this task) fused in. peft applies `dropout(x)` to the norm's
+# output before lora_A; here the kernel writes x and the dropped copies in one pass from the
+# fp32 value, and the masks are never stored: they come from a Philox counter (seed, element
+# index), so the backward kernel regenerates them while it folds the LoRA branch gradients into
+# the norm's input gradient.
+# ---------------------------------------------------------------------------------------------
+
+
+@triton.jit(do_not_specialize=["seed1", "seed2"])
+def _custom_rmsnorm_drop_fwd_kernel(
+    X, W, Y, Rsqrt, Yd1, Yd2,
+    stride_x_row, stride_y_row,
+    N, eps, p_drop, drop_scale, seed1, seed2,
+    NUM_DROP: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    row_idx = tl.program_id(0).to(tl.int64)
+    cols = tl.arange(0, BLOCK_SIZE)
+    mask = cols < N
+    x = tl.load(X + row_idx * stride_x_row + cols, mask=mask, other=0.0).to(tl.float32)
+
+    var = tl.sum(x * x, axis=0) / N
+    rsqrt = tl.rsqrt(var + eps)
+    tl.store(Rsqrt + row_idx, rsqrt)
+
+    w = tl.load(W + cols, mask=mask, other=0.0).to(tl.float32)
+    y = x * rsqrt * w
+    y_off = row_idx * stride_y_row + cols
+    tl.store(Y + y_off, y.to(Y.dtype.element_ty), mask=mask)
+
+    if NUM_DROP >= 1:
+        rand_off = (row_idx * N + cols).to(tl.int32)
+        keep = tl.rand(seed1, rand_off) >= p_drop
+        tl.store(Yd1 + y_off, tl.where(keep, y * drop_scale, 0.0).to(Yd1.dtype.element_ty),
+                 mask=mask)
+        if NUM_DROP >= 2:
+            keep2 = tl.rand(seed2, rand_off) >= p_drop
+            tl.store(Yd2 + y_off, tl.where(keep2, y * drop_scale, 0.0).to(Yd2.dtype.element_ty),
+                     mask=mask)
+
+
+@triton.jit(do_not_specialize=["seed1", "seed2"])
+def _custom_rmsnorm_drop_bwd_kernel(
+    dY, T1, T2, X, W, Rsqrt, dRes, dX,
+    stride_dy_row, stride_t_row, stride_x_row, stride_dres_row, stride_dx_row,
+    N, p_drop, drop_scale, seed1, seed2,
+    NUM_DROP: tl.constexpr,
+    HAS_DRES: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    row_idx = tl.program_id(0).to(tl.int64)
+    cols = tl.arange(0, BLOCK_SIZE)
+    mask = cols < N
+    dy = tl.load(dY + row_idx * stride_dy_row + cols, mask=mask, other=0.0).to(tl.float32)
+    if NUM_DROP >= 1:
+        rand_off = (row_idx * N + cols).to(tl.int32)
+        t1 = tl.load(T1 + row_idx * stride_t_row + cols, mask=mask, other=0.0).to(tl.float32)
+        dy += tl.where(tl.rand(seed1, rand_off) >= p_drop, t1 * drop_scale, 0.0)
+        if NUM_DROP >= 2:
+            t2 = tl.load(T2 + row_idx * stride_t_row + cols, mask=mask, other=0.0).to(tl.float32)
+            dy += tl.where(tl.rand(seed2, rand_off) >= p_drop, t2 * drop_scale, 0.0)
+
+    x = tl.load(X + row_idx * stride_x_row + cols, mask=mask, other=0.0).to(tl.float32)
+    w = tl.load(W + cols, mask=mask, other=0.0).to(tl.float32)
+    rsqrt = tl.load(Rsqrt + row_idx)
+    dy_w = dy * w
+    c1 = tl.sum(dy_w * x, axis=0) / N
+    dx = rsqrt * (dy_w - x * (rsqrt * rsqrt * c1))
+    if HAS_DRES:
+        dx += tl.load(dRes + row_idx * stride_dres_row + cols, mask=mask, other=0.0).to(tl.float32)
+    tl.store(dX + row_idx * stride_dx_row + cols, dx.to(dX.dtype.element_ty), mask=mask)
+
+
+def _block_for(n):
+    return BLOCK_SIZE if n <= BLOCK_SIZE else triton.next_power_of_2(n)
+
+
+def rmsnorm_drop_fwd(x, weight, eps, out_dtype, p_drop=0.0, seeds=()):
+    """y = RMSNorm(x) in `out_dtype`, plus one dropped copy of y per seed (at most two)."""
+    M, N = x.shape
+    y = torch.empty((M, N), device=x.device, dtype=out_dtype)
+    rsqrt = torch.empty(M, device=x.device, dtype=torch.float32)
+    drops = [torch.empty_like(y) for _ in seeds]
+    yd1 = drops[0] if len(drops) > 0 else y
+    yd2 = drops[1] if len(drops) > 1 else y
+    s1 = seeds[0] if len(seeds) > 0 else 0
+    s2 = seeds[1] if len(seeds) > 1 else 0
+    _custom_rmsnorm_drop_fwd_kernel[(M,)](
+        x, weight, y, rsqrt, yd1, yd2,
+        x.stride(0), y.stride(0),
+        N, eps, p_drop, 1.0 / (1.0 - p_drop), s1, s2,
+        NUM_DROP=len(seeds),
+        BLOCK_SIZE=_block_for(N),
+        num_warps=4,
+        num_stages=2,
+    )
+    return y, rsqrt, drops
+
+
+def rmsnorm_drop_bwd(dy, x, weight, rsqrt, d_res=None, p_drop=0.0, seeds=(), branch_grads=(),
+                     out=None):
+    """dx of RMSNorm for dy + sum(dropout_k(branch_grads[k])), plus d_res; fp32 by default."""
+    M, N = x.shape
+    if out is None:
+        out = torch.empty((M, N), device=x.device, dtype=torch.float32)
+    t1 = branch_grads[0] if len(branch_grads) > 0 else dy
+    t2 = branch_grads[1] if len(branch_grads) > 1 else dy
+    s1 = seeds[0] if len(seeds) > 0 else 0
+    s2 = seeds[1] if len(seeds) > 1 else 0
+    dres = d_res if d_res is not None else dy
+    _custom_rmsnorm_drop_bwd_kernel[(M,)](
+        dy, t1, t2, x, weight, rsqrt, dres, out,
+        dy.stride(0), t1.stride(0), x.stride(0), dres.stride(0), out.stride(0),
+        N, p_drop, 1.0 / (1.0 - p_drop), s1, s2,
+        NUM_DROP=len(branch_grads),
+        HAS_DRES=d_res is not None,
+        BLOCK_SIZE=_block_for(N),
+        num_warps=4,
+        num_stages=2,
+    )
+    return out
+
+
+def fused_add_rmsnorm_fwd(residual, x, weight, eps, out_dtype):
+    """(residual + x, RMSNorm(residual + x), rsqrt) with the sum kept in residual's dtype."""
+    M, N = residual.shape
+    res_out = torch.empty_like(residual)
+    y = torch.empty((M, N), device=residual.device, dtype=out_dtype)
+    rsqrt = torch.empty(M, device=residual.device, dtype=torch.float32)
+    _custom_fused_add_rmsnorm_fwd_kernel[(M,)](
+        residual, x, weight, res_out, y, rsqrt,
+        residual.stride(0), x.stride(0), res_out.stride(0), y.stride(0),
+        N, eps,
+        BLOCK_SIZE=_block_for(N),
+        num_warps=4,
+        num_stages=2,
+    )
+    return res_out, y, rsqrt
+
+
+def fused_add_rmsnorm_bwd_(dy, d_res_out, res_out, weight, rsqrt):
+    """Gradient w.r.t. the sum (= both addends), written over `res_out` (no longer needed)."""
+    M, N = res_out.shape
+    _custom_fused_add_rmsnorm_bwd_kernel[(M,)](
+        dy, d_res_out, res_out, weight, rsqrt, res_out,
+        dy.stride(0), d_res_out.stride(0), res_out.stride(0), res_out.stride(0),
+        N,
+        HAS_DRES=True,
+        BLOCK_SIZE=_block_for(N),
+        num_warps=4,
+        num_stages=2,
+    )
+    return res_out
