@@ -175,6 +175,36 @@ def _get_mlp_compute_dtype(mlp):
     return cd
 
 
+class _known_package_distributions:
+    """While TRL imports: `importlib.metadata.packages_distributions()` returns the mapping
+    transformers already built at its own import, instead of rebuilding it.
+
+    Both libraries compute it at import time, and building it stats every file of every
+    installed distribution (seconds on Kaggle's image). Nothing is installed in between, so the
+    mapping is the same; the stdlib function is restored right after the import."""
+
+    def __enter__(self):
+        import importlib.metadata as metadata
+
+        self._metadata = metadata
+        self._original = None
+        try:
+            from transformers.utils import import_utils
+
+            known = getattr(import_utils, "PACKAGE_DISTRIBUTION_MAPPING", None)
+        except Exception:
+            known = None
+        if isinstance(known, dict) and known:
+            self._original = metadata.packages_distributions
+            metadata.packages_distributions = lambda: {k: list(v) for k, v in known.items()}
+        return self
+
+    def __exit__(self, *exc):
+        if self._original is not None:
+            self._metadata.packages_distributions = self._original
+        return False
+
+
 def _install_fast_path():
     from solution import timeline, warmup
 
@@ -193,7 +223,8 @@ def _install_fast_path():
     except Exception:
         pass
     try:
-        from trl import SFTTrainer
+        with _known_package_distributions():
+            from trl import SFTTrainer
 
         if not getattr(SFTTrainer.compute_loss, "_soup_fast", False):
             SFTTrainer.compute_loss = fast_qwen2.make_compute_loss(SFTTrainer.compute_loss)

@@ -35,7 +35,7 @@ def torch_keep(n, d, seed, p):
 def main():
     torch.manual_seed(0)
     n, d, p = 512, 1536, 0.3
-    x = torch.randn(n, d, device="cuda").sign() * (0.5 + torch.rand(n, d, device="cuda"))
+    x = (torch.randint(0, 2, (n, d), device="cuda") * 2.0 - 1.0) * (0.5 + torch.rand(n, d, device="cuda"))
     w = torch.rand(d, device="cuda") + 0.5
     y, rs, (d1, d2) = rmsnorm_drop_fwd(x, w, 1e-6, torch.float16, p, (123, 456))
     for seed, drop in ((123, d1), (456, d2)):
