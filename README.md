@@ -10,21 +10,22 @@ own `@triton.jit` kernels in `solution/`.
 **Public Kaggle notebook:** TODO — https://www.kaggle.com/code/madiyarzhumazhan/notebook0b34895d24
 (make it public, set `COMMIT`, Save & Run All, paste the version link here and in `SUBMISSION.md`).
 
-## Results (Kaggle T4, `harness/run_task.py`, one base and one solution run)
+## Results (Kaggle T4, `harness/run_task.py`, one base and one solution run per session)
 
 | | Base Soup | Ours | |
 |---|---|---|---|
-| Whole `soup train` command | 78.2 s | 57.8 s | **1.35x faster** |
-| of which the 64 training steps | 55.9 s | 32.8 s | 1.70x |
-| Median step | 0.884 s | 0.495 s | 1.79x |
+| Whole `soup train` command | 90.8 s / 78.2 s | 61.7 s / 57.8 s | **1.47x / 1.35x faster** |
+| of which the 64 training steps | 56.4 s / 55.9 s | 32.2 s / 32.8 s | 1.75x / 1.70x |
+| Median step | 0.893 s / 0.884 s | 0.489 s / 0.495 s | 1.8x |
 | Peak GPU memory (nvidia-smi) | 14,345 MiB | 1,779 MiB | **8.06x less** |
-| Held-out eval loss (public rows) | 2.04966 | 2.04953 | −0.006 % |
+| Held-out eval loss (public rows) | 2.04970 / 2.04966 | 2.04955 / 2.04953 | −0.007 % / −0.006 % |
 | Loss curve vs base | | first step 0.00 %, mean 0.05 % | |
-| Our kernels' share of training time (check 4) | | 15.9 % | |
+| Our kernels' share of training time (check 4) | | 16.3 % / 15.9 % | |
 
-All 10 checks of `harness/check_rules.py` pass, including the 79 Soup regression tests with
-the patches applied. Base times vary by ±5 s between Kaggle sessions (we measured base at 78–87
-s); the ratio is taken within one session.
+Two Kaggle sessions (commit 62c1000 / commit 6974411, the same step). All 10 checks of
+`harness/check_rules.py` pass in both, including the 79 Soup regression tests with the patches
+applied. The base command's time varies a lot between sessions (78–91 s for us, mostly outside
+the training steps); the ratio is taken within one session.
 
 Where a step's GPU time goes now (torch.profiler, ~426 ms per step): cuBLAS GEMMs 68 % (about
 22 TFLOPS, close to what a T4 sustains), SDPA attention 12 %, NF4 dequantization 7 %, the other
@@ -141,7 +142,8 @@ through its API; it needs your own Kaggle credentials in `~/.kaggle/kaggle.json`
 - **Speed vs memory.** Recomputation costs ~25 % more GEMM work in the backward pass (~85 ms
   of a 0.5 s step). Keeping each layer's gate|up output and residual sum instead would buy most
   of that back for ~60 MB per layer at the longest batch; we chose the memory result.
-- **Fixed cost.** ~23 s of the 58 s are Soup's imports, model loading and saving, untouched.
+- **Fixed cost.** 25–30 s of our ~60 s are Soup's imports, model loading and saving, untouched
+  (the base command spends the same there).
 - **Attention** is PyTorch's memory-efficient SDPA on padded q/k/v. A varlen kernel would skip
   the padding, but on a T4 per-sequence calls leave most SMs idle; a Triton flash kernel was not
   faster for us earlier.
