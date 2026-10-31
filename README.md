@@ -29,7 +29,7 @@ the training steps); the ratio is taken within one session.
 
 Where a step's GPU time goes now (torch.profiler, ~426 ms per step): cuBLAS GEMMs 68 % (about
 22 TFLOPS, close to what a T4 sustains), SDPA attention 12 %, NF4 dequantization 7 %, the other
-kernels of ours ~10 %. About 23 s of the command is Soup's own startup, model loading and
+kernels of ours ~10 %. 25–30 s of the command are Soup's own startup, model loading and
 saving, the same as for the base run.
 
 ## What we did
