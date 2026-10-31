@@ -206,14 +206,9 @@ class _known_package_distributions:
 
 
 def _install_fast_path():
-    from solution import timeline, warmup
+    from solution import warmup
 
     warmup.start()
-    try:
-        if torch.cuda.is_available() and torch.cuda.is_initialized():
-            timeline.install()
-    except Exception:
-        pass
     try:
         from transformers.models.qwen2 import modeling_qwen2
 

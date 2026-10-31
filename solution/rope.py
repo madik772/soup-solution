@@ -182,11 +182,12 @@ def rope(x, cos, sin):
 
 
 # ---------------------------------------------------------------------------------------------
-# Packed (padding-free) attention input: one kernel takes the fused q|k|v projection of the real
-# tokens, rotates q and k, repeats the key/value heads for grouped-query attention and writes the
-# padded [B, S, H, D] tensors SDPA reads (zeros at padding). The backward kernel undoes all of
-# it in one pass per real token: inverse rotation, sum over the repeated heads, back to the
-# packed q|k|v layout. Rotation in fp32 as transformers does it (cos/sin are fp32 there).
+# Attention input: one kernel takes the fused q|k|v projection of the real tokens, rotates q and
+# k, repeats the key/value heads for grouped-query attention and writes q, k, v either packed
+# ([1, N, H, D], what varlen attention reads) or padded ([B, S, H, D] for SDPA, zeros at the
+# padding). The backward kernel undoes all of it in one pass per real token: inverse rotation,
+# sum over the repeated heads, back to the packed q|k|v layout. Rotation in fp32 as
+# transformers does it (cos/sin are fp32 there).
 # ---------------------------------------------------------------------------------------------
 
 

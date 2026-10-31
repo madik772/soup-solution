@@ -8,12 +8,15 @@ What one labelled training forward does here instead of transformers' path:
 * each decoder layer is one autograd Function. Its forward keeps only its fp32 input (the
   residual stream); the backward recomputes what it needs, skipping down_proj, whose input
   gradient needs only the weight, and reuses the recomputed dequantized weights for the
-  backward GEMMs, so every frozen weight is dequantized twice per step (forward, backward);
+  backward GEMMs, so every frozen weight is dequantized twice per step (forward, backward).
+  Within a fixed memory budget the last layers of a step also keep their gate|up output and
+  residual sum and skip that part of the recomputation (more layers for shorter batches);
 * q|k|v and gate|up are one GEMM each over a jointly dequantized weight; LoRA (q_proj, v_proj)
   is added in the GEMM epilogue (addmm with alpha=scaling); its dropout masks are made inside
-  the input RMSNorm kernel and regenerated, never stored;
-* attention: SDPA (memory-efficient kernel, causal) on padded q/k/v written by one Triton kernel
-  that also applies RoPE and repeats the KV heads;
+  the input RMSNorm kernel from a counter hash and regenerated, never stored;
+* attention: PyTorch's memory-efficient kernel in its varlen form (cu_seqlens, causal) on the
+  packed tokens, with q / k / v written by one Triton kernel that also applies RoPE and repeats
+  the KV heads; padded SDPA is the fallback if that kernel does not pass its self-test;
 * the head and the loss run chunked over the packed tokens (cross_entropy.LMHeadLossFunction),
   which also yields TRL's entropy / token accuracy and Soup's per-row rewind losses, so the
   [B, S, 151936] logits are never built.
@@ -25,8 +28,6 @@ padding, packed batches, ...) is detected before the step and goes through the o
 """
 
 import random
-import sys
-import time
 import warnings
 from types import SimpleNamespace
 
@@ -50,7 +51,7 @@ from solution.rope import (
 )
 from solution.swiglu import swiglu_packed_bwd_, swiglu_packed_fwd
 from solution.unpad import inverse_map, row_gather
-from solution import timeline, warmup
+from solution import warmup
 
 F16 = torch.float16
 STEP_ATTR = "_soup_chunked_step"  # where Soup's rewind recorder looks for per-token losses
@@ -230,7 +231,6 @@ def plan_batch(trainer, model, inputs, num_items_in_batch):
         _warn_once(str(exc))
         return None
     warmup.wait()
-    timeline.stop_sampler()
 
     B, S = ids.shape
     dev = ids.device
@@ -544,38 +544,11 @@ def rewind_step(plan):
     return SimpleNamespace(token_loss=token_loss.view(plan.B, plan.S))
 
 
-# Diagnostics for a few steps: where a step's wall time goes (CPU issue vs GPU wait).
-DIAG_STEPS = range(3, 9)
-_DIAG = SimpleNamespace(step=0, prev=None)
-
-
-def _diag_report(now):
-    d = _DIAG.prev
-    if d is None:
-        return
-    _DIAG.prev = None
-    period = (now - d["t0"]) * 1000
-    parts = {k: v * 1000 for k, v in d.items() if k not in ("t0", "_step")}
-    rest = period - sum(parts.values())
-    print(f"[solution-step] step {d_step(d)}: {period:6.1f} ms = "
-          + " | ".join(f"{k} {v:5.1f}" for k, v in parts.items()) + f" | rest {rest:5.1f}",
-          file=sys.stderr, flush=True)
-
-
-def d_step(d):
-    return d.get("_step", "?")
-
-
 def make_compute_loss(original):
     """TRL SFTTrainer.compute_loss with the packed step when the batch and model allow it."""
     from transformers import Trainer
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
-        t0 = time.perf_counter()
-        _diag_report(t0)
-        step = _DIAG.step
-        _DIAG.step += 1
-        diag = step in DIAG_STEPS and torch.cuda.is_available()
         try:
             plan = plan_batch(self, model, inputs, num_items_in_batch)
         except Exception as exc:  # noqa: BLE001 - a planning failure must not stop training
@@ -584,7 +557,6 @@ def make_compute_loss(original):
         if plan is None:
             return original(self, model, inputs, return_outputs=return_outputs,
                             num_items_in_batch=num_items_in_batch)
-        t1 = time.perf_counter()
         mode = "train" if self.model.training else "eval"
         inputs.pop("_prediction_loss_only", None)
         inputs["use_cache"] = False
@@ -596,32 +568,8 @@ def make_compute_loss(original):
             _STATE.plan = None
         if not plan.consumed:
             raise RuntimeError("solution: the packed step was planned but the model did not run it")
-        t2 = time.perf_counter()
-        if diag:
-            torch.cuda.synchronize()
-        t3 = time.perf_counter()
         log_trl_metrics(self, mode, inputs, plan)
         setattr(self, STEP_ATTR, rewind_step(plan))
-        t4 = time.perf_counter()
-        if diag:
-            times = {"_step": step, "t0": t0, "plan": t1 - t0, "fwd issue": t2 - t1,
-                     "fwd gpu": t3 - t2, "metrics": t4 - t3}
-            _DIAG.prev = times
-            acc = self.accelerator
-            plain_backward = acc.backward
-
-            def timed_backward(*args, **kwargs):
-                b0 = time.perf_counter()
-                try:
-                    return plain_backward(*args, **kwargs)
-                finally:
-                    b1 = time.perf_counter()
-                    torch.cuda.synchronize()
-                    times["bwd issue"] = b1 - b0
-                    times["bwd gpu"] = time.perf_counter() - b1
-                    acc.backward = plain_backward
-
-            acc.backward = timed_backward
         return (loss, outputs) if return_outputs else loss
 
     compute_loss._soup_fast = True
