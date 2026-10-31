@@ -8,7 +8,8 @@ logits. Most of the work that is not a cuBLAS GEMM or attention runs in our own 
 kernels in `solution/`.
 
 **Public Kaggle notebook:** https://www.kaggle.com/code/madiyarzhumazhan/notebook0b34895d24
-(the saved version with `COMMIT` pinned is linked in `SUBMISSION.md`).
+— saved version 22, `COMMIT` e9ae1cc, all checks passed:
+https://www.kaggle.com/code/madiyarzhumazhan/notebook0b34895d24?scriptVersionId=364187255
 
 ## Results (Kaggle T4, `harness/run_task.py`, base and solution in the same session)
 

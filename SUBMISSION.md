@@ -6,7 +6,8 @@
   and our Kaggle helper only; `solution/` is unchanged)
 - Public Kaggle notebook (the same link is in the README):
   https://www.kaggle.com/code/madiyarzhumazhan/notebook0b34895d24 — saved version with `COMMIT`
-  pinned: version 22 (COMMIT e9ae1cc) — TODO paste its link (Version history → the version → copy link)
+  pinned (version 22, COMMIT e9ae1cc):
+  https://www.kaggle.com/code/madiyarzhumazhan/notebook0b34895d24?scriptVersionId=364187255
 - Demo video (up to 3 minutes): TODO
 - Presentation: TODO
 
