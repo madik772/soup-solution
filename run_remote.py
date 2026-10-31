@@ -195,7 +195,7 @@ DIAGNOSTICS_MARKER = "# soup-remote-diagnostics"
 DIAGNOSTICS_SOURCE = (
     f"{DIAGNOSTICS_MARKER}\n"
     "!cd /kaggle/working/repo && for f in runs/*/train.log; do echo \"===== $f\"; "
-    "grep -n -i -E 'error|traceback|warn|fast path|exception|\\[solution\\]' $f | tail -n 25; "
+    "grep -n -i -E 'error|traceback|warn|fast path|exception|\\[solution' $f | tail -n 45; "
     "tail -n 40 $f; done\n"
     "import json, glob\n"
     "for path in sorted(glob.glob('/kaggle/working/repo/runs/*/metrics.json')):\n"
