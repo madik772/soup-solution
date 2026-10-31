@@ -58,11 +58,12 @@ STEP_ATTR = "_soup_chunked_step"  # where Soup's rewind recorder looks for per-t
 _SDPA = getattr(F, "_orig_scaled_dot_product_attention", F.scaled_dot_product_attention)
 _STATE = SimpleNamespace(plan=None, disabled=False, rng=None, varlen=None)
 
-# Activations kept for the backward pass instead of recomputed (gate|up output and the residual
-# sum, ~41 KB per token and layer), in at most this many bytes per step: the last layers of
-# the step keep theirs, the others recompute. The budget bounds the extra peak memory whatever
-# the batch length; short batches keep more layers.
-KEEP_BUDGET_BYTES = 256 * 2**20
+# Bytes per step for what the forward leaves for the backward: every layer's fp32 input (6 KB
+# per token and layer) plus, for the last layers of the step, their gate|up output and residual
+# sum (~41 KB per token and layer), which those layers then do not recompute. A fixed budget
+# keeps the peak flat whatever the batch length: short batches keep more layers, long ones
+# fewer (none once the inputs alone fill it).
+ACTIVATION_BUDGET_BYTES = 512 * 2**20
 
 
 class Unsupported(Exception):
@@ -256,8 +257,9 @@ def plan_batch(trainer, model, inputs, num_items_in_batch):
     if _STATE.varlen is None:
         _STATE.varlen = _varlen_attention_works(dev, infos[0])
 
-    per_token = infos[0].inter * 2 * 2 + infos[0].hidden * 4 + 4
-    n_keep = min(len(infos), KEEP_BUDGET_BYTES // max(1, n_real * per_token))
+    inputs_bytes = len(infos) * n_real * infos[0].hidden * 4
+    per_layer = n_real * (infos[0].inter * 2 * 2 + infos[0].hidden * 4 + 4)
+    n_keep = min(len(infos), max(0, ACTIVATION_BUDGET_BYTES - inputs_bytes) // per_layer)
     keep = [i >= len(infos) - n_keep for i in range(len(infos))]
 
     rotary = lm.model.rotary_emb

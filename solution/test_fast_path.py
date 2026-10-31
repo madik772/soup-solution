@@ -133,7 +133,7 @@ def test_packed_step_matches_transformers(monkeypatch, varlen, keep_budget):
     """Both attention paths (varlen / padded SDPA), with every layer recomputed or kept."""
     from solution import fast_qwen2
 
-    monkeypatch.setattr(fast_qwen2, "KEEP_BUDGET_BYTES", keep_budget)
+    monkeypatch.setattr(fast_qwen2, "ACTIVATION_BUDGET_BYTES", keep_budget)
     monkeypatch.setattr(fast_qwen2._STATE, "varlen", None if varlen else False)
     pm = _tiny_qlora_qwen2(dropout=0.0)
     inputs = _batch(pm.config.vocab_size)
@@ -200,3 +200,34 @@ def test_packed_step_dropout_masks_are_consistent():
     predicted = (eps * gnorm ** 2).item()
     actual = (loss2 - loss).item()
     assert abs(actual - predicted) < 0.25 * abs(predicted) + 1e-4
+
+
+@needs_cuda
+def test_rmsnorm_dropout_masks():
+    """Keep rate 1 - p, independent masks per seed, kept values scaled exactly, and the
+    backward kernel regenerating the forward's masks."""
+    from solution.rmsnorm import rmsnorm_drop_bwd, rmsnorm_drop_fwd
+
+    torch.manual_seed(0)
+    n, d, p = 512, 1536, 0.3
+    x = torch.randn(n, d, device="cuda")
+    w = torch.rand(d, device="cuda") + 0.5
+    y, rs, (d1, d2) = rmsnorm_drop_fwd(x, w, 1e-6, torch.float16, p, (123, 456))
+    ref = (x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + 1e-6) * w)
+    torch.testing.assert_close(y.float(), ref, rtol=2e-3, atol=2e-3)
+    for drop in (d1, d2):
+        kept = drop != 0
+        assert abs(1 - kept.float().mean().item() - p) < 0.01
+        torch.testing.assert_close(drop[kept].float(), (ref / (1 - p))[kept], rtol=2e-3, atol=2e-3)
+    agree = ((d1 != 0) == (d2 != 0)).float().mean().item()
+    assert abs(agree - (p * p + (1 - p) ** 2)) < 0.01  # independent masks
+
+    # backward with dy = 0: only the dropped branches flow, through the same masks
+    t1 = torch.randn(n, d, device="cuda").half()
+    t2 = torch.randn(n, d, device="cuda").half()
+    zero = torch.zeros(n, d, device="cuda", dtype=torch.float16)
+    dx = rmsnorm_drop_bwd(zero, x, w, rs, p_drop=p, seeds=(123, 456), branch_grads=(t1, t2))
+    dy = (t1.float() * (d1 != 0) + t2.float() * (d2 != 0)) / (1 - p)
+    xr = x.clone().requires_grad_(True)
+    (xr * torch.rsqrt(xr.pow(2).mean(-1, keepdim=True) + 1e-6) * w).backward(dy)
+    torch.testing.assert_close(dx, xr.grad, rtol=2e-3, atol=2e-3)

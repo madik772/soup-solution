@@ -46,8 +46,14 @@ def _wrap(owner, name, label):
     setattr(owner, name, wrapper)
 
 
+_INSTALLED = []
+
+
 def install():
     mark("apply()")
+    if _INSTALLED:
+        return
+    _INSTALLED.append(True)
     atexit.register(mark, "interpreter exit")
     try:
         from soup_cli.trainer import sft

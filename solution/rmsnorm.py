@@ -254,10 +254,24 @@ def fused_add_rmsnorm(residual, x, weight, eps=1e-6, out_dtype=None):
 # input_layernorm of the packed decoder layer, with the LoRA dropout of the projections that
 # read it (q_proj and v_proj in this task) fused in. peft applies `dropout(x)` to the norm's
 # output before lora_A; here the kernel writes x and the dropped copies in one pass from the
-# fp32 value, and the masks are never stored: they come from a Philox counter (seed, element
-# index), so the backward kernel regenerates them while it folds the LoRA branch gradients into
-# the norm's input gradient.
+# fp32 value, and the masks are never stored: they are a function of (seed, element index), so
+# the backward kernel regenerates them while it folds the LoRA branch gradients into the norm's
+# input gradient.
 # ---------------------------------------------------------------------------------------------
+
+
+@triton.jit
+def _custom_dropout_keep(counter, seed, p_drop):
+    """Keep mask, P(keep) = 1 - p_drop, from a counter hash: the murmur3 32-bit finalizer of
+    counter + seed * 2^32/phi, top 24 bits as a uniform in [0, 1). Same (seed, counter), same
+    mask; far cheaper to compile and run than Philox, and plenty for dropout."""
+    x = counter.to(tl.uint32) + seed.to(tl.uint32) * 0x9E3779B9
+    x = x ^ (x >> 16)
+    x = x * 0x85EBCA6B
+    x = x ^ (x >> 13)
+    x = x * 0xC2B2AE35
+    x = x ^ (x >> 16)
+    return (x >> 8).to(tl.float32) * (1.0 / 16777216.0) >= p_drop
 
 
 @triton.jit(do_not_specialize=["seed1", "seed2"])
@@ -283,12 +297,12 @@ def _custom_rmsnorm_drop_fwd_kernel(
     tl.store(Y + y_off, y.to(Y.dtype.element_ty), mask=mask)
 
     if NUM_DROP >= 1:
-        rand_off = (row_idx * N + cols).to(tl.int32)
-        keep = tl.rand(seed1, rand_off) >= p_drop
+        rand_off = row_idx * N + cols
+        keep = _custom_dropout_keep(rand_off, seed1, p_drop)
         tl.store(Yd1 + y_off, tl.where(keep, y * drop_scale, 0.0).to(Yd1.dtype.element_ty),
                  mask=mask)
         if NUM_DROP >= 2:
-            keep2 = tl.rand(seed2, rand_off) >= p_drop
+            keep2 = _custom_dropout_keep(rand_off, seed2, p_drop)
             tl.store(Yd2 + y_off, tl.where(keep2, y * drop_scale, 0.0).to(Yd2.dtype.element_ty),
                      mask=mask)
 
@@ -307,12 +321,12 @@ def _custom_rmsnorm_drop_bwd_kernel(
     mask = cols < N
     dy = tl.load(dY + row_idx * stride_dy_row + cols, mask=mask, other=0.0).to(tl.float32)
     if NUM_DROP >= 1:
-        rand_off = (row_idx * N + cols).to(tl.int32)
+        rand_off = row_idx * N + cols
         t1 = tl.load(T1 + row_idx * stride_t_row + cols, mask=mask, other=0.0).to(tl.float32)
-        dy += tl.where(tl.rand(seed1, rand_off) >= p_drop, t1 * drop_scale, 0.0)
+        dy += tl.where(_custom_dropout_keep(rand_off, seed1, p_drop), t1 * drop_scale, 0.0)
         if NUM_DROP >= 2:
             t2 = tl.load(T2 + row_idx * stride_t_row + cols, mask=mask, other=0.0).to(tl.float32)
-            dy += tl.where(tl.rand(seed2, rand_off) >= p_drop, t2 * drop_scale, 0.0)
+            dy += tl.where(_custom_dropout_keep(rand_off, seed2, p_drop), t2 * drop_scale, 0.0)
 
     x = tl.load(X + row_idx * stride_x_row + cols, mask=mask, other=0.0).to(tl.float32)
     w = tl.load(W + cols, mask=mask, other=0.0).to(tl.float32)
