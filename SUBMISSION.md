@@ -6,7 +6,7 @@
   and our Kaggle helper only; `solution/` is unchanged)
 - Public Kaggle notebook (the same link is in the README):
   https://www.kaggle.com/code/madiyarzhumazhan/notebook0b34895d24 — saved version with `COMMIT`
-  pinned: TODO paste the version link after Save & Run All
+  pinned: version 22 (COMMIT e9ae1cc) — TODO paste its link (Version history → the version → copy link)
 - Demo video (up to 3 minutes): TODO
 - Presentation: TODO
 
@@ -47,12 +47,13 @@ Ideas taken from other kernels, with links (we wrote the code ourselves):
 ## Results on Kaggle T4 (from `runs/result.json` and `runs/checks.json` of the notebook above)
 | | Base Soup | Ours | Ratio |
 |---|---|---|---|
-| Time of `soup train`, s | 87.42 | 50.79 | speedup 1.721x |
+| Time of `soup train`, s | 89.23 | 52.22 | speedup 1.709x |
 | Peak GPU memory, MiB | 14345 | 2099 | base/ours 6.834x |
-| Eval loss (public rows) | 2.04967 | 2.04958 | −0.004 % vs base |
+| Eval loss (public rows) | 2.04964 | 2.04959 | −0.002 % vs base |
 
-(The same step in four other sessions: 1.66x, 1.59x, 1.58x, 1.50x — base and solution times move
-with the session's T4; the ratio is taken within one session.)
+Notebook version 22, COMMIT e9ae1cc: ALL CHECKS PASSED, our kernels 15.9 % of the training time.
+(The same step in other sessions: 1.72x, 1.66x, 1.62x, 1.59x, 1.58x, 1.50x — base and solution
+times move with the session's T4; the ratio is taken within one session.)
 
 - [x] All 10 checks of `harness/check_rules.py` passed
 - [x] README.md rewritten for our solution: what we did, how to run it, results, limits

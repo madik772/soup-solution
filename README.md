@@ -23,8 +23,8 @@ kernels in `solution/`.
 | Our kernels' share of training time (check 4) | | 17.0 % | |
 
 Commit c64181f. All 10 checks of `harness/check_rules.py` pass, including the 79 Soup regression
-tests with the patches applied, and the 34 tests of `solution/`. The same code in four other
-sessions: 1.66x, 1.59x, 1.58x, 1.50x — a T4's clock and the machine's disk and CPU vary between
+tests with the patches applied, and the 34 tests of `solution/`. The same code in other
+sessions: 1.71x (the linked notebook, version 22), 1.66x, 1.62x, 1.59x, 1.58x, 1.50x — a T4's clock and the machine's disk and CPU vary between
 Kaggle sessions (base 82–90 s, our training loop 26.8–31.6 s), so the ratio moves by ±0.1.
 
 Where a step's GPU time goes (torch.profiler, ~360 ms per step): cuBLAS GEMMs ~73 % (about 22
